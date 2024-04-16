@@ -71,6 +71,7 @@ class DatasetName:
     ms_agent = 'ms-agent'
     ms_agent_for_agentfabric_default = 'ms-agent-for-agentfabric-default'
     ms_agent_for_agentfabric_addition = 'ms-agent-for-agentfabric-addition'
+    ms_agent_multirole = 'ms-agent-multirole'
     damo_agent_zh = 'damo-agent-zh'
     damo_agent_mini_zh = 'damo-agent-mini-zh'
     agent_instruct_all_en = 'agent-instruct-all-en'
@@ -1239,6 +1240,26 @@ register_dataset(
         repair_conversations=_repair_conversations_agent_instruct),
     get_dataset_from_repo,
     tags=['chat', 'agent', 'multi-round'])
+
+def _preprocess_msagent_multirole_dataset(dataset: HfDataset) -> HfDataset:
+    prompt = '语音转文本'
+    audio_key = 'Audio:FILE'
+    response_key = 'Text:LABEL'
+    query_format = f'Audio 1:<audio>{{audio_path}}</audio>\n{prompt}'
+    query = []
+    response = []
+    for d in tqdm(dataset):
+        query.append(query_format.format(audio_path=d[audio_key]))
+        response.append(d[response_key].replace(' ', ''))
+    dataset = HfDataset.from_dict({'query': query, 'response': response})
+    return dataset
+
+
+
+register_dataset(
+    DatasetName.ms_agent_multirole,
+    'iic/MSAgent-MultiRole', [('default', 'train')], None, _preprocess_msagent_multirole_dataset, get_dataset_from_repo,
+    tags=['chat', 'agent', 'multi-round','role-play','multi-agent'])
 
 register_dataset(
     DatasetName.codefuse_evol_instruction_zh,
