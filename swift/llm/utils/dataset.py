@@ -1241,25 +1241,36 @@ register_dataset(
     get_dataset_from_repo,
     tags=['chat', 'agent', 'multi-round'])
 
+
 def _preprocess_msagent_multirole_dataset(dataset: HfDataset) -> HfDataset:
-    prompt = '语音转文本'
-    audio_key = 'Audio:FILE'
-    response_key = 'Text:LABEL'
-    query_format = f'Audio 1:<audio>{{audio_path}}</audio>\n{prompt}'
+    res_prompt = """\n\n【注意事项】\n1. 这是聊天室，不要发送私信给任何人\n2. 仅代表你个人说话,不要扮演其他人，
+    只根据对话历史进行回复\n3. 长话短说，不要说太多话，不要超过50字 """
+    history_prompt = '\n\n【chat history】'
+    conv_prompt = '\n {name}:{content}'
     query = []
     response = []
-    for d in tqdm(dataset):
-        query.append(query_format.format(audio_path=d[audio_key]))
-        response.append(d[response_key].replace(' ', ''))
-    dataset = HfDataset.from_dict({'query': query, 'response': response})
-    return dataset
 
+    for d in dataset:
+        conv = d['conversations']
+        system = conv[0]['value']
+        if '【注意事项】' not in system:
+            system += res_prompt
+        system += history_prompt
+        response.append(conv[-1]['value'])
+        for i in range(1, len(conv)):
+            system += conv_prompt.format(
+                name=conv[i]['from'], content=conv[i]['value'])
+        query.append(system)
+    return HfDataset.from_dict({'query': query, 'response': response})
 
 
 register_dataset(
     DatasetName.ms_agent_multirole,
-    'iic/MSAgent-MultiRole', [('default', 'train')], None, _preprocess_msagent_multirole_dataset, get_dataset_from_repo,
-    tags=['chat', 'agent', 'multi-round','role-play','multi-agent'])
+    'iic/MSAgent-MultiRole', [('default', 'train')],
+    None,
+    _preprocess_msagent_multirole_dataset,
+    get_dataset_from_repo,
+    tags=['chat', 'agent', 'multi-round', 'role-play', 'multi-agent'])
 
 register_dataset(
     DatasetName.codefuse_evol_instruction_zh,
