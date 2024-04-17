@@ -1257,7 +1257,7 @@ def _preprocess_msagent_multirole_dataset(dataset: HfDataset) -> HfDataset:
             system += res_prompt
         system += history_prompt
         response.append(conv[-1]['value'])
-        for i in range(1, len(conv)):
+        for i in range(1, len(conv) - 1):
             system += conv_prompt.format(
                 name=conv[i]['from'], content=conv[i]['value'])
         query.append(system)

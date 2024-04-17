@@ -431,26 +431,63 @@ print()
 
 
 ## 搭配Modelscope-Agent使用
-### 工具调用微调
-结合[Modelscope-Agent](https://github.com/modelscope/modelscope-agent)，微调模型用于搭建可以调用工具的Agent
+结合[Modelscope-Agent](https://github.com/modelscope/modelscope-agent)，微调模型搭建不同用途的Agent
 
-本节针对Modelscope-Agent中的交互式框架AgentFabric，微调小模型qwen-7b-chat使其具有工具调用能力
+### 目录
+- [环境搭建](#环境搭建)
+- [工具调用微调](#工具调用微调)
+- [角色扮演微调](#角色扮演微调)
+
+### 环境搭建
+
+### 工具调用微调
+本节结合Modelscope-Agent中的交互式框架AgentFabric，微调小模型qwen-7b-chat使其具有**工具调用**能力
 
 由于ms-agent中的system prompt与Modelscope-Agent中的system prompt格式不匹配，直接训练效果不佳，为此我们根据ms-agent转换格式得到新数据集[ms_agent_for_agentfabric](https://modelscope.cn/datasets/AI-ModelScope/ms_agent_for_agentfabric/summary)，现已集成到SWIFT中。
+
 其中`ms-agent-for-agentfabric-default`包含3万条由ms-agent转换的数据集，`ms-agent-for-agentfabric-additional`包含488条由开源的AgentFabric框架实际调用访问数据筛选得到
 
 
 #### 微调
 使用`ms-agent-for-agentfabric`和`ms-agent-for-agentfabric-default`作为微调的数据集
 ```shell
-# Experimental environment: 8GPU
-nproc_per_node=8
+# 单卡
+CUDA_VISIBLE_DEVICES=0 \
+swift sft \
+    --model_id_or_path qwen/Qwen-7B-Chat \
+    --model_revision master \
+    --sft_type lora \
+    --tuner_backend swift \
+    --dtype AUTO \
+    --output_dir output \
+    --dataset ms-agent-for-agentfabric-default ms-agent-for-agentfabric-addition \
+    --train_dataset_mix_ratio 2.0 \
+    --train_dataset_sample -1 \
+    --num_train_epochs 2 \
+    --max_length 1500 \
+    --check_dataset_strategy warning \
+    --lora_rank 8 \
+    --lora_alpha 32 \
+    --lora_dropout_p 0.05 \
+    --lora_target_modules ALL \
+    --gradient_checkpointing true \
+    --batch_size 2 \
+    --weight_decay 0.1 \
+    --learning_rate 5e-5 \
+    --gradient_accumulation_steps 16 \
+    --max_grad_norm 0.5 \
+    --warmup_ratio 0.03 \
+    --eval_steps 100 \
+    --save_steps 100 \
+    --save_total_limit 2 \
+    --logging_steps 10 \
 
-PYTHONPATH=../../.. \
-torchrun \
-    --nproc_per_node=$nproc_per_node \
-    --master_port 29500 \
-    llm_sft.py \
+# 多卡DDP
+nproc_per_node=8
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+NPROC_PER_NODE=$nproc_per_node \
+MASTER_PORT=29500 \
+swift sft \
     --model_id_or_path qwen/Qwen-7B-Chat \
     --model_revision master \
     --sft_type lora \
@@ -489,8 +526,7 @@ CUDA_VISIBLE_DEVICES=0 swift export \
 #### AgentFabric
 ##### 环境安装
 ```bash
-git clone https://github.com/modelscope/modelscope-agent.git
-cd modelscope-agent  && pip install -r requirements.txt && pip install -r apps/agentfabric/requirements.txt
+pip install -r apps/agentfabric/requirements.txt
 ```
 
 ##### 部署模型
@@ -544,11 +580,15 @@ python app.py
 
 可以看到微调后的模型可以正确理解指令并调用工具
 
-### 角色扮演Agent
+### 角色扮演微调
+本节结合Modelscope-Agent中的多人聊天室应用，微调小模型qwen-7b-chat使其具有**角色扮演**能力
+
+数据集使用[魔搭Agent多角色智能体数据集](https://modelscope.cn/datasets/iic/MSAgent-MultiRole/summary)
 
 微调
 ```bash
-CUDA_VISIBLE_DEVICE=1
+# 单卡
+CUDA_VISIBLE_DEVICES=0 \
 swift sft \
     --model_id_or_path qwen/Qwen-7B-Chat \
     --model_revision master \
@@ -557,6 +597,43 @@ swift sft \
     --dtype AUTO \
     --output_dir output \
     --dataset ms-agent-multirole \
+    --train_dataset_sample -1 \
+    --train_dataset_mix_ratio 2.0 \
+    --train_dataset_sample -1 \
+    --num_train_epochs 2 \
+    --max_length 1500 \
+    --check_dataset_strategy warning \
+    --lora_rank 8 \
+    --lora_alpha 32 \
+    --lora_dropout_p 0.05 \
+    --lora_target_modules ALL \
+    --gradient_checkpointing true \
+    --gradient_accumulation_steps 16 \
+    --batch_size 2 \
+    --weight_decay 0.1 \
+    --learning_rate 5e-5 \
+    --max_grad_norm 0.5 \
+    --warmup_ratio 0.03 \
+    --eval_steps 100 \
+    --save_steps 100 \
+    --save_total_limit 2 \
+    --logging_steps 10
+
+# 多卡DDP
+nproc_per_node=8
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+NPROC_PER_NODE=$nproc_per_node \
+MASTER_PORT=29500 \
+swift sft \
+    --model_id_or_path qwen/Qwen-7B-Chat \
+    --model_revision master \
+    --sft_type lora \
+    --tuner_backend swift \
+    --dtype AUTO \
+    --output_dir output \
+    --dataset ms-agent-multirole \
+    --train_dataset_sample -1 \
+    --train_dataset_mix_ratio 2.0 \
     --train_dataset_sample -1 \
     --num_train_epochs 2 \
     --max_length 1500 \
@@ -578,11 +655,11 @@ swift sft \
     --logging_steps 10
 ```
 
+
 merge lora
-```bash
+```
 CUDA_VISIBLE_DEVICES=0 swift export \
-    --ckpt_dir /mnt/workspace/hujinghan.hjh/hjh/swift/output/qwen-7b-chat/v4-20240416-183319/checkpoint-100 \
-    --merge_lora true
+    --ckpt_dir '/path/to/qwen-7b-chat/vx-xxx/checkpoint-xxx' --merge_lora true
 ```
 
 部署
@@ -590,6 +667,11 @@ CUDA_VISIBLE_DEVICES=0 swift export \
 CUDA_VISIBLE_DEVICE=1 python -m vllm.entrypoints.openai.api_server --model /mnt/workspace/hujinghan.hjh/hjh/swift/output/qwen-7b-chat/v4-20240416-183319/checkpoint-100-merged --trust-remote-code
 ```
 
+#### 聊天室
+##### 环境安装
+```bash
+pip install -r apps/agentfabric/requirements.txt
+```
 
 
 ## 总结
