@@ -434,14 +434,19 @@ print()
 结合[Modelscope-Agent](https://github.com/modelscope/modelscope-agent)，微调模型搭建不同用途的Agent
 
 ### 目录
-- [环境搭建](#环境搭建)
-- [工具调用微调](#工具调用微调)
-- [角色扮演微调](#角色扮演微调)
+- [环境安装](#环境安装)
+- [工具调用Agent](#工具调用Agent)
+- [角色扮演Agent](#角色扮演Agent)
 
-### 环境搭建
+### 环境安装
+```bash
+git clone https://github.com/modelscope/modelscope-agent.git
+cd modelscope-agent
+pip install -r requirements.txt
+```
 
-### 工具调用微调
-本节结合Modelscope-Agent中的交互式框架AgentFabric，微调小模型qwen-7b-chat使其具有**工具调用**能力
+### 工具调用Agent
+本节微调小模型qwen-7b-chat使其具有**工具调用**能力, 并结合Modelscope-Agent中的交互式框架AgentFabric，搭建一个自定义的工具调用Agent
 
 由于ms-agent中的system prompt与Modelscope-Agent中的system prompt格式不匹配，直接训练效果不佳，为此我们根据ms-agent转换格式得到新数据集[ms_agent_for_agentfabric](https://modelscope.cn/datasets/AI-ModelScope/ms_agent_for_agentfabric/summary)，现已集成到SWIFT中。
 
@@ -580,12 +585,12 @@ python app.py
 
 可以看到微调后的模型可以正确理解指令并调用工具
 
-### 角色扮演微调
-本节结合Modelscope-Agent中的多人聊天室应用，微调小模型qwen-7b-chat使其具有**角色扮演**能力
+### 角色扮演Agent
+本节微调小模型qwen-7b-chat使其具有**角色扮演**能力, 并结合Modelscope-Agent中的聊天室应用，搭建一个自定义的工具调用Agent
 
-数据集使用[魔搭Agent多角色智能体数据集](https://modelscope.cn/datasets/iic/MSAgent-MultiRole/summary)
+数据集使用[魔搭Agent多角色智能体数据集](https://modelscope.cn/datasets/iic/MSAgent-MultiRole/summary)，现已集成到SWIFT中。
 
-微调
+#### 微调
 ```bash
 # 单卡
 CUDA_VISIBLE_DEVICES=0 \
@@ -620,8 +625,8 @@ swift sft \
     --logging_steps 10
 
 # 多卡DDP
-nproc_per_node=8
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+nproc_per_node=2
+CUDA_VISIBLE_DEVICES=0,1 \
 NPROC_PER_NODE=$nproc_per_node \
 MASTER_PORT=29500 \
 swift sft \
@@ -667,11 +672,43 @@ CUDA_VISIBLE_DEVICES=0 swift export \
 CUDA_VISIBLE_DEVICE=1 python -m vllm.entrypoints.openai.api_server --model /mnt/workspace/hujinghan.hjh/hjh/swift/output/qwen-7b-chat/v4-20240416-183319/checkpoint-100-merged --trust-remote-code
 ```
 
-#### 聊天室
+#### Modelscope-Agent 聊天室
 ##### 环境安装
 ```bash
-pip install -r apps/agentfabric/requirements.txt
+pip install -r apps/multi_roles_chat_room/requirements.txt
 ```
+
+##### 部署模型
+使用以下任意一种方式部署模型
+###### swift deploy
+```bash
+CUDA_VISIBLE_DEVICES=0 swift deploy --ckpt_dir /path/to/qwen-7b-chat/vx-xxx/checkpoint-xxxx-merged
+```
+
+###### vllm
+```bash
+python -m vllm.entrypoints.openai.api_server --model /path/to/qwen-7b-chat/vx-xxx/checkpoint-xxxx-merged --trust-remote-code
+```
+
+##### 添加本地模型配置
+在`modelscope-agent/apps/multi_roles_chat_room/role_core.py`中修改`model_config`
+(修改图)
+注意，如果使用`swift deploy`部署，需要将`"model"`的值设为`qwen-7b-chat`
+
+在方法xxx中，删除以下代码。。。
+
+
+##### 启动聊天室应用
+```bash
+export PYTHONPATH=$PYTHONPATH:/path/to/your/modelscope-agent
+cd modelscope-agent/apps/multi_roles_chat_room
+python app.py
+```
+
+无需修改模型，可以在右侧的。。。修改角色设置
+
+
+
 
 
 ## 总结
