@@ -198,6 +198,8 @@ class ModelType:
     internlm2_math_20b_chat = 'internlm2-math-20b-chat'
     # internlm-xcomposer2
     internlm_xcomposer2_7b_chat = 'internlm-xcomposer2-7b-chat'
+    # internvl
+    internvl_chat_v1_5 = 'internvl-chat-v1-5'
     # deepseek
     deepseek_7b = 'deepseek-7b'
     deepseek_7b_chat = 'deepseek-7b-chat'
@@ -3486,6 +3488,22 @@ def get_model_tokenizer_yi_vl(model_dir: str,
     if not hasattr(model.config, 'max_sequence_length'):
         model.config.max_sequence_length = 2048
     return model, tokenizer
+
+@register_model(
+    ModelType.internvl_chat_v1_5,
+    'OpenGVLab/InternVL-Chat-V1-5',
+    LoRATM.llama2,
+    TemplateType.yi_vl,
+    support_flash_attn=True,
+    requires=['transformers>=4.34'],
+    tags=['multi-modal', 'vision'],
+    hf_model_id='01-ai/Yi-VL-6B')
+def get_model_tokenizer_intern_vl(model_dir: str,
+                              torch_dtype: Dtype,
+                              model_kwargs: Dict[str, Any],
+                              load_model: bool = True,
+                              **kwargs):
+    pass
 
 
 @register_model(

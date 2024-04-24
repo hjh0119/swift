@@ -79,6 +79,7 @@ class DatasetName:
     toolbench_for_alpha_umi_caller = 'toolbench-for-alpha-umi-caller'
     toolbench_for_alpha_umi_planner = 'toolbench-for-alpha-umi-planner'
     toolbench_for_alpha_umi_summarizer = 'toolbench-for-alpha-umi-summarizer'
+    ms_agent_flan = 'ms-agent-flan'
     # coding
     code_alpaca_en = 'code-alpaca-en'
     leetcode_python_en = 'leetcode-python-en'
@@ -1566,6 +1567,49 @@ def add_self_cognition_dataset(
 
 
 NoneType = type(None)
+
+def _preprocess_agent_flan(dataset, check_dataset_strategy='delete'):
+    prompts = ['在当前步骤中你的想法是什么?','需要调用哪个API?', '调用这个API需要哪些参数?', '参数{}的值是什么？']
+    modules = ['Thgouhts:']
+    query = []
+    response = []
+    # for test cnt
+    cnt_reason, cnt_else = 0,0
+    for d in dataset:
+        try:
+            conv = d['conversations']
+            sys = conv[0]['value']
+            r = conv[-1]['value']
+            # reasoning
+            if  r.count("Thought:") >= 2:
+                query.append(sys + '在当前步骤中你的想法是什么?')
+                response.append(re.search(r'Thought: ([^\n]+)', r).group(1))
+                cnt_reason += 1
+            # retrieval
+            query.append(sys + '需要调用哪个API?')
+            response.append(re.search(r'Action: ([^\n]+)', r).group(1))
+            # understanding
+            # paras = re.search(r'Action Input: ([^\n]+)', r).group(1)
+            parsed_json = json.loads(re.search(r'Action Input: ([\s\S]*?)\n', r).group(1))
+
+            query.append(sys + '调用API需要哪些参数?')
+            response.append(", ".join(parsed_json.keys()))
+            # understanding_2
+
+            query.append(sys + '参数{}的值是什么?'.format(", ".join(parsed_json.keys())))
+            response.append(f"{key}:{value}" for key, value in parsed_json.items())
+
+            query.append(sys + conv)
+        except KeyError or AttributeError:
+            continue
+    return HfDataset.from_dict({'query': query, 'response': response})
+
+register_dataset(
+    DatasetName.ms_agent_flan,
+    'iic/ms_agent', ['train'], [],
+    ConversationsPreprocessor(PreprocessFunc=_preprocess_agent_flan, error_strategy='delete'),
+    get_dataset_from_repo,
+    tags=['chat', 'agent', 'multi-round', '🔥'])
 
 
 def _check_dataset(
