@@ -823,8 +823,17 @@ def get_model_tokenizer_from_repo(model_dir: str,
             )
         else:
             with context:
-                model = automodel_class.from_pretrained(
-                    model_dir, config=model_config, torch_dtype=torch_dtype, trust_remote_code=True, **model_kwargs)
+                if model_config.quantization_config['quant_method'] == 'gptq':
+                    from auto_gptq import AutoGPTQForCausalLM
+                    model = AutoGPTQForCausalLM.from_pretrained(
+                        model_dir, config=model_config, torch_dtype=torch_dtype, trust_remote_code=True, **model_kwargs)
+                elif model_config.quantization_config['quant_method'] == 'awq':
+                    from awq import AutoAWQForCausalLM
+                    model = AutoAWQForCausalLM.from_pretrained(
+                        model_dir, config=model_config, torch_dtype=torch_dtype, trust_remote_code=True, **model_kwargs)
+                else:
+                    model = automodel_class.from_pretrained(
+                        model_dir, config=model_config, torch_dtype=torch_dtype, trust_remote_code=True, **model_kwargs)
         if load_model and is_awq:
             model.is_awq = is_awq
         if load_model and gptq_bits > 0:
