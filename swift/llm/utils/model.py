@@ -825,11 +825,10 @@ def get_model_tokenizer_from_repo(model_dir: str,
             with context:
                 if model_config.quantization_config['quant_method'] == 'gptq':
                     from auto_gptq import AutoGPTQForCausalLM
-                    model = AutoGPTQForCausalLM.from_pretrained(
-                        model_dir, config=model_config, torch_dtype=torch_dtype, trust_remote_code=True, **model_kwargs)
+                    model = AutoGPTQForCausalLM.from_quantized(model_dir, trust_remote_code=True, **model_kwargs)
                 elif model_config.quantization_config['quant_method'] == 'awq':
                     from awq import AutoAWQForCausalLM
-                    model = AutoAWQForCausalLM.from_pretrained(
+                    model = AutoAWQForCausalLM.from_quantized(
                         model_dir, config=model_config, torch_dtype=torch_dtype, trust_remote_code=True, **model_kwargs)
                 else:
                     model = automodel_class.from_pretrained(
