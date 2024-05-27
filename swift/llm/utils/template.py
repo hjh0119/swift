@@ -347,6 +347,12 @@ class Template:
         """
         return: inputs, tokenizer_kwargs
         """
+        KEYWORDS = [
+            'What is the tool you want to use',
+            'What are the required parameter names',
+            'What is the value of',
+            'What are the required parameter names for this tool',
+        ]
         history = history.copy()
         res_context_list: List[Context] = []
         compute_loss_idx: List[float] = []
@@ -363,6 +369,8 @@ class Template:
             prefix, res_context_list, compute_loss_idx, system=system, loss_scale_value=loss_scale_value)
         history.append([query, response])
         for i, (q, r) in enumerate(history):
+            if q and any(word in q for word in KEYWORDS):
+                loss_scale_value = 3.0
             context_list = self.prompt.copy()
             if i < len(history) - 1:
                 context_list.append('{{RESPONSE}}')
