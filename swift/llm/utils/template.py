@@ -371,6 +371,8 @@ class Template:
         for i, (q, r) in enumerate(history):
             if q and any(word in q for word in KEYWORDS):
                 loss_scale_value = 3.0
+            else:
+                loss_scale_value = None
             context_list = self.prompt.copy()
             if i < len(history) - 1:
                 context_list.append('{{RESPONSE}}')
