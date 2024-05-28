@@ -935,8 +935,9 @@ class InternvlTemplate(Template):
 
     def data_collator(self, batch: List[Dict[str, Any]], padding_to: Optional[int] = None) -> Dict[str, Any]:
         res = super().data_collator(batch, padding_to)
-        res['pixel_values'] = torch.concat([b['pixel_values'] for b in batch if 'pixel_values' in b])
-        res['image_flags'] = torch.concat([b['image_flags'] for b in batch if 'pixel_values' in b])
+        if any('pixel_values' in b for b in batch):
+            res['pixel_values'] = torch.concat([b['pixel_values'] for b in batch])
+            res['image_flags'] = torch.concat([b['image_flags'] for b in batch])
         return res
 
     @staticmethod
