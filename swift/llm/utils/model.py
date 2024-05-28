@@ -2099,6 +2099,34 @@ def get_model_tokenizer_chatglm(model_dir: str,
     support_vllm=True,
     requires=['transformers>=4.37'],
     hf_model_id='Qwen/Qwen2-1.5B')
+@register_model(
+    ModelType.qwen2_7b,
+    'qwen/Qwen2-7B',
+    LoRATM.qwen1half,
+    TemplateType.default_generation,
+    support_flash_attn=True,
+    support_vllm=True,
+    requires=['transformers>=4.37'],
+    hf_model_id='Qwen/Qwen2-7B')
+@register_model(
+    ModelType.qwen2_72b,
+    'qwen/Qwen2-72B',
+    LoRATM.qwen1half,
+    TemplateType.default_generation,
+    support_flash_attn=True,
+    support_vllm=True,
+    requires=['transformers>=4.37'],
+    hf_model_id='Qwen/Qwen2-72B')
+@register_model(
+    ModelType.qwen2_moe_57b_a14b,
+    'qwen/Qwen2-MoE-57B-A14B',
+    LoRATM.qwen1half,
+    TemplateType.default_generation,
+    support_gradient_checkpointing=False,
+    support_flash_attn=True,
+    support_vllm=True,
+    requires=['transformers>=4.40'],
+    hf_model_id='Qwen/Qwen2-MoE-57B-A14B')
 def get_model_tokenizer_with_flash_attn(model_dir: str,
                                         torch_dtype: Dtype,
                                         model_kwargs: Dict[str, Any],
@@ -2115,25 +2143,6 @@ def get_model_tokenizer_with_flash_attn(model_dir: str,
         model_config._flash_attn_2_enabled = use_flash_attn
     return get_model_tokenizer_from_repo(
         model_dir, torch_dtype, model_kwargs, load_model, model_config=model_config, **kwargs)
-
-@register_model(
-    ModelType.qwen2_moe_57b_a14b,
-    'qwen/Qwen2-MoE-57B-A14B',
-    LoRATM.qwen1half,
-    TemplateType.default_generation,
-    support_flash_attn=True,
-    support_vllm=True,
-    requires=['transformers>=4.40'],
-    hf_model_id='Qwen/Qwen2-MoE-57B-A14B')
-def get_model_tokenizer_with_qwem2moe(model_dir: str,
-                                      torch_dtype: Dtype,
-                                      model_kwargs: Dict[str, Any],
-                                      load_model: bool = True,
-                                      **kwargs):
-    model, tokenizer = get_model_tokenizer_with_flash_attn(model_dir, torch_dtype, model_kwargs, load_model, **kwargs)
-    if model is not None:
-        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': True})
-    return model, tokenizer
     
 @register_model(
     ModelType.qwen1half_0_5b_chat_awq,
