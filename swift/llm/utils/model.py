@@ -109,6 +109,7 @@ class ModelType:
     qwen2_1_5b = 'qwen2-1_5b'
     qwen2_7b = 'qwen2-7b'
     qwen2_72b = 'qwen2-72b'
+    qwen2_7b_instruct = 'qwen2-7b-instruct'
     qwen2_moe_57b_a14b = 'qwen2-moe-57b-a14b'
     # qwen-vl
     qwen_vl = 'qwen-vl'
@@ -2662,6 +2663,15 @@ def get_model_tokenizer_qwen1half_intx(model_dir: str,
     support_flash_attn=True,
     support_vllm=True,
     hf_model_id='internlm/internlm2-base-20b')
+@register_model(
+    ModelType.qwen2_7b_instruct,
+    '/mnt/nas2/huangjintao.hjt/.cache/modelscope/hub/qwen/Qwen2-72B-Instruct',
+    LoRATM.llama2,
+    TemplateType.qwen,
+    support_flash_attn=True,
+    support_vllm=True,
+    requires=['transformers>=4.37'],
+    hf_model_id='Qwen/Qwen2-7B-Instruct')
 def get_model_tokenizer_internlm2(model_dir: str,
                                   torch_dtype: Dtype,
                                   model_kwargs: Dict[str, Any],
