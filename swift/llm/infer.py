@@ -31,6 +31,8 @@ def save_checkpoint(model: Optional[PreTrainedModel],
                     save_safetensors: bool = True) -> None:
     if model is not None:
         model.save_pretrained(target_dir, safe_serialization=save_safetensors)
+    if hasattr(tokenizer, 'processor'):
+        tokenizer.processor.save_pretrained(target_dir)
     tokenizer.save_pretrained(target_dir)
     model_type = getattr(tokenizer, 'model_type')
     fname_list = ['generation_config.json', 'preprocessor_config.json']
@@ -194,7 +196,7 @@ def prepare_model_template(args: InferArguments,
                              f'args.max_model_len: {args.max_model_len}, model.max_model_len: {model.max_model_len}')
     # Preparing LoRA
     if is_adapter(args.sft_type) and args.ckpt_dir is not None:
-        if isinstance(args, DeployArguments):
+        if isinstance(args, DeployArguments) and args.lora_request_list is not None:
             for lora_request in args.lora_request_list:
                 model = Swift.from_pretrained(
                     model, lora_request.lora_local_path, lora_request.lora_name, inference_mode=True)
@@ -381,6 +383,9 @@ def llm_infer(args: InferArguments) -> None:
                 'response': response,
                 'history': history,
             }
+            images = infer_kwargs.get('images')
+            if images is not None:
+                obj['images'] = images
             history = new_history
             if jsonl_path is not None:
                 append_to_jsonl(jsonl_path, obj)
@@ -436,6 +441,8 @@ def llm_infer(args: InferArguments) -> None:
                 request['system'] = system
                 if images is not None:
                     request['images'] = images
+                if args.truncation_strategy:
+                    request['truncation_strategy'] = args.truncation_strategy
                 request_list.append(request)
             resp_list = inference_vllm(llm_engine, template, request_list, use_tqdm=True)
             result = []
@@ -450,6 +457,9 @@ def llm_infer(args: InferArguments) -> None:
                     'label': request.pop('label', None),
                     'history': request['history'],
                 }
+                images = request.get('images')
+                if images is not None:
+                    obj['images'] = images
                 if jsonl_path is not None:
                     append_to_jsonl(jsonl_path, obj)
                 result.append(obj)
@@ -489,8 +499,6 @@ def llm_infer(args: InferArguments) -> None:
                     response, _ = inference(
                         model, template, stream=args.stream and args.verbose, verbose=args.verbose, **kwargs)
                 label = data.pop('response', None)
-                if 'truncation_strategy' in kwargs:
-                    kwargs.pop('truncation_strategy')
                 obj = {
                     'system': kwargs['system'],
                     'query': kwargs['query'],
@@ -498,6 +506,8 @@ def llm_infer(args: InferArguments) -> None:
                     'label': label,
                     'history': kwargs['history'],
                 }
+                if images is not None:
+                    obj['images'] = images
                 if jsonl_path is not None:
                     append_to_jsonl(jsonl_path, obj)
                 result.append(obj)

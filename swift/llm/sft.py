@@ -21,7 +21,7 @@ from swift.utils import (check_json_format, compute_acc_metrics, compute_nlg_met
                          preprocess_logits_for_metrics, seed_everything, show_layers, use_torchacc)
 from .accelerator import ta_accelerate
 from .tuner import prepare_model
-from .utils import (TEMPLATE_MAPPING, LazyLLMDataset, SftArguments, Template, dataset_map, get_dataset,
+from .utils import (MODEL_MAPPING, TEMPLATE_MAPPING, LazyLLMDataset, SftArguments, Template, dataset_map, get_dataset,
                     get_model_tokenizer, get_template, get_time_info, print_example, set_generation_config,
                     sort_by_max_length, stat_dataset)
 
@@ -101,6 +101,13 @@ def llm_sft(args: SftArguments) -> Dict[str, Union[str, Any]]:
         kwargs['use_flash_attn'] = args.use_flash_attn
     if args.local_repo_path:
         kwargs['local_repo_path'] = args.local_repo_path
+    if args.quant_method == 'awq':
+        kwargs['is_awq'] = True
+    elif args.quant_method == 'aqlm':
+        kwargs['is_aqlm'] = True
+    elif args.quant_method == 'gptq':
+        kwargs['is_gptq'] = True
+
     model, tokenizer = get_model_tokenizer(
         args.model_type,
         args.torch_dtype,
