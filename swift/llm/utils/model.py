@@ -109,8 +109,13 @@ class ModelType:
     qwen2_1_5b = 'qwen2-1_5b'
     qwen2_7b = 'qwen2-7b'
     qwen2_72b = 'qwen2-72b'
+    qwen2_0_5b_instruct = 'qwen2-0_5b-instruct'
+    qwen2_1_5b_instruct = 'qwen2-1_5b-instruct'
     qwen2_7b_instruct = 'qwen2-7b-instruct'
+    qwen2_72b_instruct = 'qwen2-72b-instruct'
     qwen2_moe_57b_a14b = 'qwen2-moe-57b-a14b'
+    qwen2_moe_57b_a14b_instruct = 'qwen2-moe-57b-a14b-instruct'
+
     # qwen-vl
     qwen_vl = 'qwen-vl'
     qwen_vl_chat = 'qwen-vl-chat'
@@ -2664,14 +2669,50 @@ def get_model_tokenizer_qwen1half_intx(model_dir: str,
     support_vllm=True,
     hf_model_id='internlm/internlm2-base-20b')
 @register_model(
+    ModelType.qwen2_0_5b_instruct,
+    'qwen/Qwen2-0.5B-Instruct',
+    LoRATM.llama2,
+    TemplateType.qwen,
+    support_flash_attn=True,
+    support_vllm=True,
+    requires=['transformers>=4.37'],
+    hf_model_id='Qwen/Qwen2-0.5B-Instruct')
+@register_model(
+    ModelType.qwen2_1_5b_instruct,
+    'qwen/Qwen2-1.5B-Instruct',
+    LoRATM.llama2,
+    TemplateType.qwen,
+    support_flash_attn=True,
+    support_vllm=True,
+    requires=['transformers>=4.37'],
+    hf_model_id='Qwen/Qwen2-1.5B-Instruct')
+@register_model(
     ModelType.qwen2_7b_instruct,
-    '/mnt/nas2/huangjintao.hjt/.cache/modelscope/hub/qwen/Qwen2-72B-Instruct',
+    'qwen/Qwen2-7B-Instruct',
     LoRATM.llama2,
     TemplateType.qwen,
     support_flash_attn=True,
     support_vllm=True,
     requires=['transformers>=4.37'],
     hf_model_id='Qwen/Qwen2-7B-Instruct')
+@register_model(
+    ModelType.qwen2_72b_instruct,
+    '/mnt/nas2/huangjintao.hjt/.cache/modelscope/hub/qwen/Qwen2-72B-Instruct',
+    LoRATM.llama2,
+    TemplateType.qwen,
+    support_flash_attn=True,
+    support_vllm=True,
+    requires=['transformers>=4.37'],
+    hf_model_id='Qwen/Qwen2-72B-Instruct')
+@register_model(
+    ModelType.qwen2_moe_57b_a14b_instruct,
+    'qwen/Qwen2-MoE-57B-A14B-Instruct',
+    LoRATM.llama2,
+    TemplateType.qwen,
+    support_flash_attn=True,
+    support_vllm=True,
+    requires=['transformers>=4.37'],
+    hf_model_id='qwen/Qwen2-MoE-57B-A14B-Instruct')
 def get_model_tokenizer_internlm2(model_dir: str,
                                   torch_dtype: Dtype,
                                   model_kwargs: Dict[str, Any],
