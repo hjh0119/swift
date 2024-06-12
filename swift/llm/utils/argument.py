@@ -1,7 +1,9 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
+import datetime as dt
 import inspect
 import math
 import os
+import platform
 import sys
 from dataclasses import dataclass, field
 from typing import List, Literal, Optional, Set, Tuple, Union
@@ -152,6 +154,10 @@ class ArgumentsBase:
             elif quantization_bit == 8:
                 require_version('bitsandbytes')
                 load_in_4bit, load_in_8bit = False, True
+            else:
+                logger.warning('bnb only support 4/8 bits quantization, you should assign --quantization_bit 4 or 8,\
+                    Or specify another quantization method; No quantization will be performed here.')
+                load_in_4bit, load_in_8bit = False, False
         else:
             load_in_4bit, load_in_8bit = False, False
 
@@ -194,7 +200,7 @@ class ArgumentsBase:
                 for sn in DATASET_MAPPING['toolbench-for-alpha-umi']['subsets']
             },
             'medical-mini-zh': 'medical-zh#50000',
-            'cmnli-mini-zh': 'cmnli-zh#20000/200',
+            'cmnli-mini-zh': 'cmnli-zh#20000',
             'coco-mini-en': 'coco-en-mini',
             'coco-mini-en-2': 'coco-en-2-mini',
             'aishell1-mini-zh': 'aishell1-zh-mini',
@@ -263,6 +269,8 @@ class ArgumentsBase:
                 self.eval_batch_size = self.per_device_eval_batch_size
             if self.deepspeed_config_path is not None:
                 self.deepspeed = self.deepspeed_config_path
+            if self.eval_strategy is not None:
+                self.evaluation_strategy = self.eval_strategy
 
     def handle_custom_dataset_info(self):
         if self.custom_dataset_info is None:
@@ -278,9 +286,10 @@ class ArgumentsBase:
         train_sample = parse_dataset_name(_dataset)[3]
         if train_sample == -1:
             train_sample = self.train_dataset_sample
-        elif self.train_dataset_sample < train_sample:
+        else:
             _dataset = _dataset[:_dataset.find('#')]
-            train_sample = self.train_dataset_sample
+            if self.train_dataset_sample < train_sample:
+                train_sample = self.train_dataset_sample
         _dataset = f'{_dataset}#{train_sample}'
         self.dataset[0] = _dataset
         self.train_dataset_sample = -1
@@ -391,7 +400,7 @@ class ArgumentsBase:
                     raise ValueError('Please use `--ckpt_dir vx-xxx/checkpoint-xxx` to use the checkpoint.')
                 if self.model_type is None:
                     raise ValueError(f"model_id_or_path: '{model_id_or_path}' is not registered. "
-                                     'Please set `--model_type <model_type>` additionally.')
+                                     'Please set `--model_type <model_type> --model_id_or_path <model_id_or_path>`.')
                 assert self.model_cache_dir is None
 
         error_msg = f'The model_type you can choose: {list(MODEL_MAPPING.keys())}'
@@ -483,6 +492,9 @@ class SftArguments(ArgumentsBase):
     # Literal['gaussian', 'pissa', 'pissa_niter_[number of iters]', 'loftq', 'true', 'false']
     init_lora_weights: str = 'true'
 
+    # rope-scaling
+    rope_scaling: Literal['linear', 'dynamic'] = None
+
     # BOFT
     boft_block_size: int = 4
     boft_block_num: int = 0
@@ -562,7 +574,7 @@ class SftArguments(ArgumentsBase):
     save_only_model: Optional[bool] = None
     save_total_limit: int = 2  # save last and best. -1: all checkpoints
     logging_steps: int = 5
-    dataloader_num_workers: int = 1
+    dataloader_num_workers: Optional[int] = None
     dataloader_pin_memory: bool = True
     dataloader_drop_last: bool = False
 
@@ -631,6 +643,7 @@ class SftArguments(ArgumentsBase):
     # compatibility hf
     per_device_train_batch_size: Optional[int] = None
     per_device_eval_batch_size: Optional[int] = None
+    eval_strategy: Literal['steps', 'epoch', 'no', None] = None
     # compatibility. (Deprecated)
     self_cognition_sample: int = 0
     train_dataset_mix_ratio: float = 0.
@@ -851,8 +864,13 @@ class SftArguments(ArgumentsBase):
         if self.lazy_tokenize is None:
             self.lazy_tokenize = template_info.get('lazy_tokenize', False)
             logger.info(f'Setting args.lazy_tokenize: {self.lazy_tokenize}')
-        if 'dataloader_num_workers' in template_info:
-            self.dataloader_num_workers = template_info['dataloader_num_workers']
+        if self.dataloader_num_workers is None:
+            if 'dataloader_num_workers' in template_info:
+                self.dataloader_num_workers = template_info['dataloader_num_workers']
+            elif platform.system() == 'Windows':
+                self.dataloader_num_workers = 0
+            else:
+                self.dataloader_num_workers = 1
             logger.info(f'Setting args.dataloader_num_workers: {self.dataloader_num_workers}')
         if 'dataloader_pin_memory' in template_info:
             self.dataloader_pin_memory = template_info['dataloader_pin_memory']
@@ -897,10 +915,13 @@ class SftArguments(ArgumentsBase):
         parameters = inspect.signature(Seq2SeqTrainingArguments.__init__).parameters
         if 'include_num_input_tokens_seen' in parameters:
             kwargs['include_num_input_tokens_seen'] = self.include_num_input_tokens_seen
+        if 'eval_strategy' in parameters:
+            kwargs['eval_strategy'] = self.evaluation_strategy
+        else:
+            kwargs['evaluation_strategy'] = self.evaluation_strategy
 
         training_args = Seq2SeqTrainingArguments(
             output_dir=self.output_dir,
-            evaluation_strategy=self.evaluation_strategy,
             logging_dir=self.logging_dir,
             per_device_train_batch_size=self.batch_size,
             per_device_eval_batch_size=self.eval_batch_size,
@@ -938,7 +959,6 @@ class SftArguments(ArgumentsBase):
             ddp_backend=self.ddp_backend,
             gradient_checkpointing=self.gradient_checkpointing,
             predict_with_generate=self.predict_with_generate,
-            # generation_config=generation_config,
             local_rank=get_dist_setting()[1],
             save_only_model=self.save_only_model,
             train_sampler_random=self.train_sampler_random,
@@ -1038,6 +1058,9 @@ class InferArguments(ArgumentsBase):
     repetition_penalty: float = 1.
     num_beams: int = 1
     stop_words: List[str] = None
+
+    # rope-scaling
+    rope_scaling: Literal['linear', 'dynamic'] = None
 
     # other
     use_flash_attn: Optional[bool] = None
@@ -1178,7 +1201,7 @@ class InferArguments(ArgumentsBase):
             sft_args = json.load(f)
         imported_keys = [
             'model_type', 'model_revision', 'sft_type', 'template_type', 'system', 'quantization_bit',
-            'bnb_4bit_comp_dtype', 'bnb_4bit_quant_type', 'bnb_4bit_use_double_quant'
+            'bnb_4bit_comp_dtype', 'bnb_4bit_quant_type', 'bnb_4bit_use_double_quant', 'rope_scaling'
         ]
         if self.load_dataset_config:
             imported_keys += [
@@ -1246,7 +1269,7 @@ class DeployArguments(InferArguments):
 @dataclass
 class EvalArguments(InferArguments):
 
-    name: Optional[str] = None
+    name: Optional[str] = field(default_factory=lambda: dt.datetime.now().strftime('%Y%m%d-%H%M%S'))
 
     eval_url: Optional[str] = None
 

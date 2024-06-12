@@ -15,17 +15,24 @@ class SwiftPreprocessor:
     def __call__(self, dataset: HfDataset) -> HfDataset:
         if 'history' in dataset.features:
             old_history = dataset['history']
-
+            has_history = False
             history: List[History] = []
-            for old_h in tqdm(old_history):
-                if isinstance(old_h, list):
-                    break
-                h = None
-                if old_h is not None:
-                    h = ast.literal_eval(old_h)
+            for h in tqdm(old_history):
+                if isinstance(h, str):
+                    h = ast.literal_eval(h)
+                elif h is None:
+                    h = []
+                if len(h) > 0:
+                    has_history = True
                 history.append(h)
-            else:
-                dataset = dataset.remove_columns(['history']).add_column('history', history)
+            dataset = dataset.remove_columns(['history'])
+            if has_history:
+                dataset = dataset.add_column('history', history)
+        if 'system' in dataset.features:
+            system = dataset['system']
+            has_system = len([sys for sys in system if sys not in {None, ''}]) > 0
+            if not has_system:
+                dataset = dataset.remove_columns(['system'])
         return dataset
 
 
@@ -139,13 +146,12 @@ class ConversationsPreprocessor:
         kwargs = {}
         if has_system:
             kwargs['system'] = system
-        if has_history:
-            kwargs['history'] = history
-
         kwargs.update({
             'query': query,
             'response': response,
         })
+        if has_history:
+            kwargs['history'] = history
         dataset = HfDataset.from_dict(kwargs)
         return dataset
 
