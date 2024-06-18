@@ -9,23 +9,17 @@ from transformers import IntervalStrategy
 from transformers.integrations import is_deepspeed_zero3_enabled
 from transformers.utils import is_torch_npu_available
 
-<<<<<<<< HEAD:swift/llm/rlhf.py
-from swift.trainers import RLHFTrainerFactory
-from swift.utils import (check_json_format, get_dist_setting, get_logger, get_main, get_model_info, is_ddp_plus_mp,
-                         is_dist, is_master, plot_images, seed_everything, show_layers)
-========
-from swift.trainers.dpo_trainers import DPOTrainer
+from swift.trainers.simpo_trainers import SimPOTrainer
 from swift.utils import (append_to_jsonl, check_json_format, get_dist_setting, get_logger, get_main, get_model_info,
                          is_ddp_plus_mp, is_dist, is_local_master, is_master, plot_images, seed_everything, show_layers)
->>>>>>>> ms/main:swift/llm/dpo.py
 from .tuner import prepare_model
-from .utils import (TEMPLATE_MAPPING, RLHFArguments, Template, get_dataset, get_model_tokenizer, get_template,
-                    get_time_info, set_generation_config)
+from .utils import (SimPOArguments, Template, get_dataset, get_model_tokenizer, get_template, get_time_info,
+                    set_generation_config)
 
 logger = get_logger()
 
 
-def llm_rlhf(args: RLHFArguments) -> str:
+def llm_simpo(args: SimPOArguments) -> str:
     logger.info(f'args: {args}')
     seed_everything(args.seed)
     training_args = args.training_args
@@ -40,25 +34,17 @@ def llm_rlhf(args: RLHFArguments) -> str:
         for device_id in range(torch.cuda.device_count()):
             torch.cuda.set_per_process_memory_fraction(max(min(args.gpu_memory_fraction, 1.0), 0.01), device=device_id)
 
-    # device map
+    # Loading Model and Tokenizer
     if is_deepspeed_zero3_enabled():
         model_kwargs = {'device_map': None}
     elif is_torch_npu_available():
         model_kwargs = {'device_map': local_rank if local_rank >= 0 else 0}
-    elif args.device_map_config_path is not None:
-        cwd = os.getcwd()
-        config_path = args.device_map_config_path if os.path.isabs(args.device_map_config_path) else os.path.join(
-            cwd, args.device_map_config_path)
-        with open(config_path, 'r') as json_file:
-            model_kwargs = {'device_map': json.load(json_file)}
     else:
         model_kwargs = {'low_cpu_mem_usage': True}
         if is_dist() and not is_ddp_plus_mp():
             model_kwargs['device_map'] = {'': local_rank}
         else:
             model_kwargs['device_map'] = 'auto'
-
-    # quantization
     if args.quant_method == 'hqq':
         from transformers import HqqConfig
         if args.hqq_dynamic_config_path is not None:
@@ -96,29 +82,19 @@ def llm_rlhf(args: RLHFArguments) -> str:
     }
     if args.use_flash_attn is not None:
         kwargs['use_flash_attn'] = args.use_flash_attn
-    if args.local_repo_path:
-        kwargs['local_repo_path'] = args.local_repo_path
-    if args.quant_method == 'awq':
-        kwargs['is_awq'] = True
-    elif args.quant_method == 'aqlm':
-        kwargs['is_aqlm'] = True
-    elif args.quant_method == 'gptq':
-        kwargs['is_gptq'] = True
-
     if args.rope_scaling:
         kwargs['rope_scaling'] = args.rope_scaling
         kwargs['max_length'] = args.max_length
-
     model, tokenizer = get_model_tokenizer(
         args.model_type,
         args.torch_dtype,
         model_kwargs,
         model_id_or_path=args.model_id_or_path,
         revision=args.model_revision,
-        is_training=True,
         **kwargs)
     logger.info(f'model_config: {model.config}')
-
+    if hasattr(model, 'hf_device_map'):
+        logger.info(f'model device_map {model.hf_device_map}')
     generation_config = GenerationConfig(
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
@@ -131,40 +107,21 @@ def llm_rlhf(args: RLHFArguments) -> str:
         eos_token_id=tokenizer.eos_token_id)
     logger.info(f'generation_config: {generation_config}')
     set_generation_config(model, generation_config)
+    training_args.generation_config = generation_config
 
-    # Preparing LoRA
     model, _ = prepare_model(model, args)
 
     show_layers(model)
-    logger.info(model)
     model_info = None
     if not is_deepspeed_zero3_enabled():
         model_info = get_model_info(model)
         logger.info(model_info)
+    logger.info(model)
 
     if args.gradient_checkpointing:
         model.config.use_cache = False  # fix transformers==4.36
         logger.info('Setting model.config.use_cache: False')
         model.enable_input_require_grads()
-
-    if args.ref_model_type is not None:
-        if args.ref_model_free:
-            logger.warning(f"{args.rlhf_type} algorithm don't require ref model,\
-                     therefore the ref model will not be loaded here.")
-            ref_model = None
-        else:
-            ref_model, _ = get_model_tokenizer(
-                args.ref_model_type,
-                args.torch_dtype,
-                model_kwargs,
-                model_id_or_path=args.ref_model_id_or_path,
-                revision=args.model_revision,
-                **kwargs)
-    else:
-        ref_model = None
-
-    if hasattr(model, 'hf_device_map'):
-        logger.info(f'model device_map {model.hf_device_map}')
 
     # Loading Dataset
     train_dataset, val_dataset = get_dataset(
@@ -174,7 +131,6 @@ def llm_rlhf(args: RLHFArguments) -> str:
         check_dataset_strategy=args.check_dataset_strategy,
         model_name=args.model_name,
         model_author=args.model_author)
-
     if len(args.val_dataset) > 0:
         # Loading val dataset
         _, val_dataset = get_dataset(
@@ -186,22 +142,13 @@ def llm_rlhf(args: RLHFArguments) -> str:
             model_author=args.model_author)
 
     train_dataset, val_dataset = args._handle_dataset_compat(train_dataset, val_dataset)
+
     if val_dataset is None:
         training_args.evaluation_strategy = IntervalStrategy.NO
         training_args.eval_strategy = IntervalStrategy.NO
         training_args.do_eval = False
     logger.info(f'train_dataset: {train_dataset}')
     logger.info(f'val_dataset: {val_dataset}')
-
-    template_kwargs = {}
-    template_info = TEMPLATE_MAPPING[args.template_type]
-    use_model = template_info.get('use_model', False)
-    if use_model:
-        template_kwargs['model'] = model
-
-    if args.sequence_parallel_size and args.sequence_parallel_size > 1:
-        template_kwargs['sequence_parallel_size'] = args.sequence_parallel_size
-
     template: Template = get_template(
         args.template_type, tokenizer, args.system, args.max_length, args.truncation_strategy, model=model)
     if not template.support_multi_round and 'history' in train_dataset[0]:
@@ -216,22 +163,25 @@ You can also use the --model_type parameter to specify the  template.')
     # Trainer
     logger.info(f'training_args: {training_args}')
 
-    trainer_kwargs = RLHFTrainerFactory.get_training_args(args)
+    trainer_kwargs = {}
+    if args.check_model_is_latest is False:
+        trainer_kwargs['check_model'] = False
 
-    if ref_model is not None:
-        trainer_kwargs['ref_model'] = ref_model
-
-    trainer_kwargs['args'].generation_config = generation_config
-    trainer_cls = RLHFTrainerFactory.get_trainer(args.rlhf_type)
-
-    trainer = trainer_cls(
+    trainer = SimPOTrainer(
         model=model,
+        beta=args.beta,
+        gamma=args.gamma,
+        label_smoothing=args.label_smoothing,
+        loss_type=args.loss_type,
+        args=training_args,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         tokenizer=tokenizer,
         template=template,
+        max_prompt_length=args.max_prompt_length,
+        max_length=args.max_length,
+        test_oom_error=args.test_oom_error,
         **trainer_kwargs)
-
     trainer.sft_args = args
     if is_master():
         for args_obj, fname in zip([args, training_args], ['sft_args.json', 'training_args.json']):
@@ -272,4 +222,4 @@ You can also use the --model_type parameter to specify the  template.')
     return run_info
 
 
-rlhf_main = get_main(RLHFArguments, llm_rlhf)
+simpo_main = get_main(SimPOArguments, llm_simpo)
