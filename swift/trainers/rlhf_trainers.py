@@ -10,7 +10,8 @@ class RLHFTrainerFactory:
         'simpo': 'swift.trainers.cpo_trainer.CPOTrainer',
         'orpo': 'swift.trainers.orpo_trainer.ORPOTrainer',
         'kto': 'swift.trainers.kto_trainer.KTOTrainer',
-        'cpo': 'swift.trainers.cpo_trainer.CPOTrainer'
+        'cpo': 'swift.trainers.cpo_trainer.CPOTrainer',
+        'rm': 'swift.trainers.reward_trainer.RewardTrainer'
     }
 
     @staticmethod

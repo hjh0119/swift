@@ -1690,7 +1690,7 @@ class PtArguments(SftArguments):
 
 @dataclass
 class RLHFArguments(SftArguments):
-    rlhf_type: Literal['dpo', 'orpo', 'simpo', 'kto', 'cpo'] = 'dpo'
+    rlhf_type: Literal['dpo', 'orpo', 'simpo', 'kto', 'cpo', 'rm'] = 'dpo'
     ref_model_type: Optional[str] = field(
         default=None, metadata={'help': f'model_type choices: {list(MODEL_MAPPING.keys())}'})
 
@@ -1711,7 +1711,7 @@ class RLHFArguments(SftArguments):
     def __post_init__(self) -> None:
         super().__post_init__()
         # without reference model
-        self.ref_model_free = self.rlhf_type in ['orpo', 'simpo', 'cpo']
+        self.ref_model_free = self.rlhf_type in ['orpo', 'simpo', 'cpo', 'rm']
         if self.rlhf_type == 'simpo':
             self.loss_type = 'simpo'
         self.set_default_beta()
@@ -1734,7 +1734,8 @@ class RLHFArguments(SftArguments):
             'kto': 'trl.trainer.kto_config.KTOConfig',
             'simpo': 'trl.trainer.cpo_config.CPOConfig',
             'cpo': 'trl.trainer.cpo_config.CPOConfig',
-            'dpo': 'trl.trainer.dpo_config.DPOConfig'
+            'dpo': 'trl.trainer.dpo_config.DPOConfig',
+            'rm': 'trl.trainer.reward_config.RewardConfig'
         }
         if self.rlhf_type in CONFIG_MAPPING:
             config_path = CONFIG_MAPPING[self.rlhf_type]
