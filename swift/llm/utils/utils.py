@@ -517,10 +517,8 @@ def to_device(inputs: Any, device: Device) -> Any:
         res = []
         for b in inputs:
             res.append(to_device(b, device))
-    elif isinstance(inputs, (int, float, str)) or inputs is None:
-        res = inputs
     else:
-        raise TypeError(f'inputs: {inputs}, {type(inputs)}')
+        res = inputs
     return res
 
 
@@ -1056,7 +1054,7 @@ def get_rope_scaling(config: PretrainedConfig):
 
 
 if is_ddp_plus_mp():
-    from accelerate.utils.modeling import (get_balanced_memory, infer_auto_device_map)
+    from accelerate.utils.modeling import get_balanced_memory, infer_auto_device_map
 
     @wraps(infer_auto_device_map)
     def _infer_auto_device_map_patch(model: Module,

@@ -224,7 +224,6 @@ def patch_itds_map():
     from datasets import IterableDataset
     from functools import wraps
 
-
     if not hasattr(IterableDataset, '_old_map'):  # Avoid double patching
         old_map = IterableDataset.map
 
