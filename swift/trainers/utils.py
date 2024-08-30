@@ -5,8 +5,8 @@ import heapq
 import inspect
 from functools import partial
 from types import FunctionType, MethodType
-from typing import Dict, List, Optional, Union
-
+from typing import Dict, List, Optional, Union, Any
+import torch
 from datasets import Dataset as HfDataset
 from torch.nn import Module
 from transformers.trainer_callback import TrainerCallback
@@ -166,7 +166,7 @@ def patch_datacollator():
                         elif k.endswith('_attention_mask'):
                             padding_value = 0
                         elif k.startswith(('chosen', 'rejected', 'completion')) or ('decoder' in k):
-                            padding_value = self.label_pad_token_id
+                            padding_value = label_pad_token_id
                         # patch here
                         elif k.endswith('_pixel_values'):
                             padding_value = 0
@@ -184,7 +184,7 @@ def patch_datacollator():
                                     ' before calling the trainer.')
                             padding_value = self.pad_token_id
                         elif k.endswith('_labels'):
-                            padding_value = self.label_pad_token_id
+                            padding_value = label_pad_token_id
                         elif k.endswith('_attention_mask'):
                             padding_value = 0
                         elif k.endswith(('_pixel_values', '_images')):
@@ -248,3 +248,136 @@ def patch_dataset_map():
 
         HfDataset.map = patched_map
         HfDataset._old_map = original_map
+
+
+def tokenize_row(feature:dict[str, List[Any]], template:Template, **kwargs) -> Dict:
+    is_encoder_decoder = kwargs.get('is_encoder_decoder', False)
+    # TODO: get _data_keys 
+    _data_keys = kwargs.get('_data_keys', None)
+    max_length = kwargs.get('max_length', 2048)
+    truncation_mode = kwargs.get('truncation_mode', 'keep_start')
+    max_prompt_length = kwargs.get('max_prompt_length', 512)
+    label_pad_token_id = kwargs.get('label_pad_token_id', -100)
+    s
+    batch = {}
+    if not is_encoder_decoder:
+        # encode without response
+        prompt = feature.copy()
+        prompt['response'] = None
+        prompt_tokens = template.encode(prompt)[0]
+        
+        if 'input_ids' not in prompt_tokens:
+            raise Exception('Detect too lengthy prompt, please consider set larger max_length ')
+        
+        # for MLLM, pop vision related data to process after
+        if prompt_tokens.get('_data', None) is not None:
+            for key in prompt_tokens['_data'].keys():
+                if key not in prompt_tokens:
+                    prompt_tokens[key] = prompt_tokens['_data'][key]
+            prompt_tokens.pop('_data')
+
+        prompt_tokens.pop('labels', None)
+
+        # convert bfloat16 to float32 to avoid conflict in mapping
+        if 'pixel_values' in prompt_tokens and prompt_tokens['pixel_values'].dtype == torch.bfloat16:
+            prompt_tokens['pixel_values'] = prompt_tokens['pixel_values'].to(torch.float32)
+
+        if 'images' in prompt_tokens and prompt_tokens['images'].dtype == torch.bfloat16:
+            prompt_tokens['images'] = prompt_tokens['images'].to(torch.float32)
+
+        if 'attention_mask' not in prompt_tokens:
+            prompt_tokens['attention_mask'] = [1] * len(prompt_tokens['input_ids'])
+
+        prompt_tokens = {f'prompt_{k}': v for k, v in prompt_tokens.items()}
+
+        # encode with response
+        chosen_tokens = build_tokenized_answer(feature['response'], template)
+        chosen_tokens.update(prompt_tokens)
+
+        rejected_tokens = build_tokenized_answer(feature['rejected_response'], template)
+        rejected_tokens.update(prompt_tokens)
+
+        longer_response_length = max(len(chosen_tokens['input_ids']), len(rejected_tokens['input_ids']))
+
+        # if combined sequence is too long, truncate the prompt
+        for answer_tokens in [chosen_tokens, rejected_tokens, prompt_tokens]:
+            if len(answer_tokens['prompt_input_ids']) + longer_response_length > max_length:
+                if truncation_mode == 'keep_start':
+                    for k in ['prompt_input_ids', 'prompt_attention_mask']:
+                        answer_tokens[k] = answer_tokens[k][:max_prompt_length]
+                elif truncation_mode == 'keep_end':
+                    for k in ['prompt_input_ids', 'prompt_attention_mask']:
+                        answer_tokens[k] = answer_tokens[k][-max_prompt_length:]
+                else:
+                    raise ValueError(f'Unknown truncation mode: {truncation_mode}')
+
+        # if that's still too long, truncate the response
+        for answer_tokens in [chosen_tokens, rejected_tokens]:
+            if len(answer_tokens['prompt_input_ids']) + longer_response_length > max_length:
+                for k in ['input_ids', 'attention_mask']:
+                    answer_tokens[k] = answer_tokens[k][:max_length - max_prompt_length]
+
+        # Create labels
+        chosen_sequence_tokens = {
+            k: chosen_tokens[f'prompt_{k}'] + chosen_tokens[k]
+            for k in ['input_ids', 'attention_mask']
+        }
+        rejected_sequence_tokens = {
+            k: rejected_tokens[f'prompt_{k}'] + rejected_tokens[k]
+            for k in ['input_ids', 'attention_mask']
+        }
+
+        chosen_sequence_tokens['labels'] = chosen_sequence_tokens['input_ids'][:]
+        _paddings = [label_pad_token_id] * len(chosen_tokens['prompt_input_ids'])
+        chosen_sequence_tokens['labels'][:len(chosen_tokens['prompt_input_ids'])] = _paddings
+        rejected_sequence_tokens['labels'] = rejected_sequence_tokens['input_ids'][:]
+        _paddings = [label_pad_token_id] * len(rejected_tokens['prompt_input_ids'])
+        rejected_sequence_tokens['labels'][:len(rejected_tokens['prompt_input_ids'])] = _paddings
+
+        for k, toks in {
+                'chosen_': chosen_sequence_tokens,
+                'rejected_': rejected_sequence_tokens,
+                '': prompt_tokens,
+        }.items():
+            for type_key, tokens in toks.items():
+                if type_key == 'token_type_ids':
+                    continue
+                batch[f'{k}{type_key}'] = tokens
+
+    else:
+        # encoder-decoder
+        prompt = feature.copy()
+        prompt['response'] = None
+        prompt_tokens = template.encode(prompt)[0]
+
+        if prompt_tokens.get('_data', None) is not None:
+            for key in prompt_tokens['_data'].keys():
+                if key not in prompt_tokens:
+                    prompt_tokens[key] = prompt_tokens['_data'][key]
+            prompt_tokens.pop('_data')
+            
+        prompt_tokens.pop('labels', None)
+
+        if 'pixel_values' in prompt_tokens and prompt_tokens['pixel_values'].dtype == torch.bfloat16:
+            # datasets do not accept bfloat16; convert to float32.
+            prompt_tokens['pixel_values'] = prompt_tokens['pixel_values'].to(torch.float32)
+        if 'attention_mask' not in prompt_tokens:
+            prompt_tokens['attention_mask'] = [1] * len(prompt_tokens['input_ids'])
+
+        prompt_tokens = {f'prompt_{k}': v for k, v in prompt_tokens.items()}
+
+        # encode with response
+        chosen_tokens = build_tokenized_answer(feature['response'], template)
+        rejected_tokens = build_tokenized_answer(feature['rejected_response'], template)
+
+        batch['chosen_labels'] = chosen_tokens['input_ids']
+        batch['rejected_labels'] = rejected_tokens['input_ids']
+
+        if model is not None and hasattr(model, 'prepare_decoder_input_ids_from_labels'):
+            batch['rejected_decoder_input_ids'] = model.prepare_decoder_input_ids_from_labels(
+                labels=torch.tensor(batch['rejected_labels']))
+            batch['chosen_decoder_input_ids'] = model.prepare_decoder_input_ids_from_labels(
+                labels=torch.tensor(batch['chosen_labels']))
+
+        batch.update(prompt_tokens)
+    return batch

@@ -223,6 +223,7 @@ class SwiftMixin:
                  preprocess_logits_for_metrics: Optional[Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = None,
                  **kwargs) -> None:
         check_model = kwargs.pop('check_model', True)
+        call_parent_init = kwargs.pop('call_parent_init', True)
         if check_model and hasattr(model, 'model_dir'):
             check_local_model_is_latest(
                 model.model_dir,
@@ -240,19 +241,20 @@ class SwiftMixin:
             model._hf_peft_config_loaded = True
         self.is_encoder_decoder = kwargs.pop('is_encoder_decoder', False)
         # mro
-        super().__init__(
-            model=model,
-            args=args,
-            data_collator=data_collator,
-            train_dataset=train_dataset,
-            eval_dataset=eval_dataset,
-            tokenizer=tokenizer,
-            model_init=model_init,
-            compute_metrics=compute_metrics,
-            callbacks=callbacks,
-            optimizers=optimizers,
-            preprocess_logits_for_metrics=preprocess_logits_for_metrics,
-            **kwargs)
+        if call_parent_init:
+            super().__init__(
+                model=model,
+                args=args,
+                data_collator=data_collator,
+                train_dataset=train_dataset,
+                eval_dataset=eval_dataset,
+                tokenizer=tokenizer,
+                model_init=model_init,
+                compute_metrics=compute_metrics,
+                callbacks=callbacks,
+                optimizers=optimizers,
+                preprocess_logits_for_metrics=preprocess_logits_for_metrics,
+                **kwargs)
         if not self.label_names:
             self.label_names = ['labels']
         if is_quantized and use_swift:
