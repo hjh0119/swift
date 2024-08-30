@@ -15,7 +15,9 @@ from transformers.trainer_utils import (EvaluationStrategy, FSDPOption, HPSearch
 
 from swift.llm.utils.template import Context, History, Template
 from swift.utils import get_logger
-
+from trl import AutoModelForCausalLMWithValueHead
+from transformers import PreTrainedModel
+import torch
 try:
     # https://github.com/huggingface/transformers/pull/25702
     from transformers.trainer_utils import ShardedDDPOption
@@ -248,3 +250,23 @@ def patch_dataset_map():
 
         HfDataset.map = patched_map
         HfDataset._old_map = original_map
+
+def patch_valuehead_model(model: "AutoModelForCausalLMWithValueHead") -> None:
+    def tie_weights(self: "AutoModelForCausalLMWithValueHead") -> None:
+        if isinstance(self.pretrained_model, PreTrainedModel):
+            self.pretrained_model.tie_weights()
+
+    def get_input_embeddings(self: "AutoModelForCausalLMWithValueHead") -> torch.nn.Module:
+        if isinstance(self.pretrained_model, PreTrainedModel):
+            return self.pretrained_model.get_input_embeddings()
+
+    def get_output_embeddings(self: "AutoModelForCausalLMWithValueHead") -> torch.nn.Module:
+        if isinstance(self.pretrained_model, PreTrainedModel):
+            return self.pretrained_model.get_output_embeddings()
+
+
+    ignore_modules = [name for name, _ in model.named_parameters() if "pretrained_model" in name]
+    setattr(model, "_keys_to_ignore_on_save", ignore_modules)
+    setattr(model, "tie_weights", MethodType(tie_weights, model))
+    setattr(model, "get_input_embeddings", MethodType(get_input_embeddings, model))
+    setattr(model, "get_output_embeddings", MethodType(get_output_embeddings, model))

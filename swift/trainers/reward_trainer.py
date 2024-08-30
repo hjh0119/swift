@@ -8,16 +8,19 @@ from trl.trainer.utils import pad_to_length
 
 from swift.utils import get_logger
 from .mixin import PushToMsHubMixin, SwiftMixin
-from .utils import build_tokenized_answer, patch_trl, sort_by_max_length
+from .utils import build_tokenized_answer, patch_trl, sort_by_max_length, patch_valuehead_model
 from swift.llm.utils.template import Template
 from accelerate import PartialState
 
 logger = get_logger()
-
+from trl import AutoModelForCausalLMWithValueHead
 
 class RewardTrainer(PushToMsHubMixin, SwiftMixin, HFRewardTrainer):
 
     def __init__(self, *args, template: Template, test_oom_error=False, **kwargs):
+        kwargs['model'] = patch_valuehead_model(AutoModelForCausalLMWithValueHead.from_pretrained(kwargs['model']))
+        
+        
         self.template = template
         template._is_training = True
         self.streaming = kwargs.pop('streaming')
@@ -210,7 +213,7 @@ class RewardTrainer(PushToMsHubMixin, SwiftMixin, HFRewardTrainer):
         inputs: Dict[str, Union[torch.Tensor, Any]],
         return_outputs=False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
-        # compatible with mllm
+        # code from trl, we patch here to make compatible with mllm
         model_kwargs = {}
         if self.is_vision_model:
             # Here, we restore the _data, processing image information within the forward hook of the model.
