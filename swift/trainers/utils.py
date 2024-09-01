@@ -5,7 +5,8 @@ import heapq
 import inspect
 from functools import partial
 from types import FunctionType, MethodType
-from typing import Dict, List, Optional, Union, Any
+from typing import Any, Dict, List, Optional, Union
+
 import torch
 from datasets import Dataset as HfDataset
 from torch.nn import Module
@@ -166,7 +167,7 @@ def patch_datacollator():
                         elif k.endswith('_attention_mask'):
                             padding_value = 0
                         elif k.startswith(('chosen', 'rejected', 'completion')) or ('decoder' in k):
-                            padding_value = label_pad_token_id
+                            padding_value = self.label_pad_token_id
                         # patch here
                         elif k.endswith('_pixel_values'):
                             padding_value = 0
@@ -184,7 +185,7 @@ def patch_datacollator():
                                     ' before calling the trainer.')
                             padding_value = self.pad_token_id
                         elif k.endswith('_labels'):
-                            padding_value = label_pad_token_id
+                            padding_value = self.label_pad_token_id
                         elif k.endswith('_attention_mask'):
                             padding_value = 0
                         elif k.endswith(('_pixel_values', '_images')):
@@ -250,9 +251,9 @@ def patch_dataset_map():
         HfDataset._old_map = original_map
 
 
-def tokenize_row(feature:dict[str, List[Any]], template:Template, **kwargs) -> Dict:
+def tokenize_row(feature: dict[str, List[Any]], template: Template, **kwargs) -> Dict:
     is_encoder_decoder = kwargs.get('is_encoder_decoder', False)
-    # TODO: get _data_keys 
+    # TODO: get _data_keys
     _data_keys = kwargs.get('_data_keys', None)
     max_length = kwargs.get('max_length', 2048)
     truncation_mode = kwargs.get('truncation_mode', 'keep_start')
@@ -265,10 +266,10 @@ def tokenize_row(feature:dict[str, List[Any]], template:Template, **kwargs) -> D
         prompt = feature.copy()
         prompt['response'] = None
         prompt_tokens = template.encode(prompt)[0]
-        
+
         if 'input_ids' not in prompt_tokens:
             raise Exception('Detect too lengthy prompt, please consider set larger max_length ')
-        
+
         # for MLLM, pop vision related data to process after
         if prompt_tokens.get('_data', None) is not None:
             for key in prompt_tokens['_data'].keys():
@@ -355,7 +356,7 @@ def tokenize_row(feature:dict[str, List[Any]], template:Template, **kwargs) -> D
                 if key not in prompt_tokens:
                     prompt_tokens[key] = prompt_tokens['_data'][key]
             prompt_tokens.pop('_data')
-            
+
         prompt_tokens.pop('labels', None)
 
         if 'pixel_values' in prompt_tokens and prompt_tokens['pixel_values'].dtype == torch.bfloat16:

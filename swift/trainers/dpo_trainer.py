@@ -71,7 +71,7 @@ class DPOTrainer(PushToMsHubMixin, SwiftMixin, HFDPOTrainer):
         elif isinstance(data, list):
             return [self._convert_bfloat16_to_float32(item) for item in data]
         return data
-        
+
     def tokenize_row(self, feature, model: Union[PreTrainedModel, nn.Module] = None) -> Dict:
 
         batch = {}
@@ -90,11 +90,12 @@ class DPOTrainer(PushToMsHubMixin, SwiftMixin, HFDPOTrainer):
                 if not self._data_keys:
                     self._data_keys = prompt_tokens['_data'].keys()
                 for key in prompt_tokens['_data'].keys():
-                    prompt_tokens[key] = prompt_tokens['_data'][key]
-                    if isinstance(prompt_tokens[key], torch.Tensor):
-                        prompt_tokens[key] = prompt_tokens[key].tolist()
+                    tgt_key = f'data_{key}'
+                    prompt_tokens[tgt_key] = prompt_tokens['_data'][key]
+                    if isinstance(prompt_tokens[f'data_{key}'], torch.Tensor):
+                        prompt_tokens[tgt_key] = prompt_tokens[tgt_key].tolist()
                 prompt_tokens.pop('_data')
-
+            prompt_tokens.pop('data_labels', None)
             prompt_tokens.pop('labels', None)
 
             # convert bfloat16 to float32 to avoid conflict in mapping
@@ -310,10 +311,13 @@ class DPOTrainer(PushToMsHubMixin, SwiftMixin, HFDPOTrainer):
                 _data = [dict() for _ in range(batch_size)]
                 for k in self._data_keys:
                     tgt_k = f'_data_{k}' if k != 'labels' else 'concatenated_data_labels'
-                    # if k == 'input_ids':
-                    #     _data = [{**d, k: concatenated_batch['concatenated_data_input_ids'][i]} for i, d in enumerate(_data)]
-                    if k == 'labels':
-                        _data = [{**d, k: concatenated_batch['concatenated_data_labels'][i]} for i, d in enumerate(_data)]
+                    if k == 'input_ids':
+                        tgt_k = 'concatenated_data_input_ids' if 'concatenated_data_input_ids' in concatenated_batch else 'concatenated_input_ids'
+                        _data = [{**d, k: concatenated_batch[tgt_k][i]} for i, d in enumerate(_data)]
+                    elif k == 'labels':
+                        _data = [{
+                            **d, k: concatenated_batch['concatenated_labels'][i]
+                        } for i, d in enumerate(_data)]
                     # for vision related data, paired response share the same one
                     elif k == 'images':
                         # convert the dtype of the images that may be converted to float32 in tokenize_row
@@ -324,7 +328,9 @@ class DPOTrainer(PushToMsHubMixin, SwiftMixin, HFDPOTrainer):
                     elif k == 'pixel_values':
                         # convert the dtype of the pixel values that may be converted to float32 in tokenize_row
                         model_dtype = self.accelerator.unwrap_model(model).dtype
-                        _data = [{**d, k: concatenated_batch[tgt_k][i // 2].to(model_dtype)} for i, d in enumerate(_data)]
+                        _data = [{
+                            **d, k: concatenated_batch[tgt_k][i // 2].to(model_dtype)
+                        } for i, d in enumerate(_data)]
                     else:
                         _data = [{**d, k: concatenated_batch[tgt_k][i // 2]} for i, d in enumerate(_data)]
                     model_kwargs['_data'] = _data
@@ -347,7 +353,7 @@ class DPOTrainer(PushToMsHubMixin, SwiftMixin, HFDPOTrainer):
             # for llava, the model returns logits for the entire sequence,
             # including the image tokens (placed before the text tokens)
             logits_len, labels_len = all_logits.shape[1], concatenated_batch['concatenated_labels'].shape[1]
-            
+
             if logits_len > labels_len:
                 all_logits = all_logits[:, -labels_len:]
             else:
@@ -457,10 +463,38 @@ class DPOTrainer(PushToMsHubMixin, SwiftMixin, HFDPOTrainer):
         # patch here
         if is_vision_model:
             # for keys appear in _data, we leave data collector in hook
+            # if 'prompt_input_ids' in batch:
+            #     _data_input_ids = [values for values in batch['prompt_input_ids']]
+            #     concatenated_batch['_data_input_ids'] = _data_input_ids
+
+            # if 'prompt_pixel_values' in batch:
+            #     pixel_values = [values for values in batch['prompt_pixel_values']]
+            #     concatenated_batch['_data_pixel_values'] = pixel_values
+
+            # if 'prompt_image_flags' in batch:
+            #     image_flags = [torch.tensor(flags) for flags in batch['prompt_image_flags']]
+            #     concatenated_batch['_data_image_flags'] = image_flags
+
+            # if 'prompt_pixel_attention_mask' in batch:
+            #     pixel_attention_mask = [mask for mask in batch['prompt_pixel_attention_mask']]
+            #     concatenated_batch['_data_pixel_attention_mask'] = pixel_attention_mask
+
+            # if 'prompt_image_sizes' in batch:
+            #     concatenated_batch['_data_image_sizes'] = batch['prompt_image_sizes']
+
+            # if 'prompta_images' in batch:
+            #     # images not in _data, we manually execute data collector here
+            #     concatenated_batch['_data_images'] = batch['prompta_images'].squeeze(1).repeat(2, 1, 1, 1).to(device=device)
+
+            # if 'prompt_image_bound' in batch:
+            #     concatenated_batch['_data_image_bound'] = batch['prompt_image_bound']
+
+            # if 'prompt_tgt_sizes' in batch:
+            #     concatenated_batch['_data_tgt_sizes'] = batch['prompt_tgt_sizes']
             if 'prompt_data_input_ids' in batch:
                 _data_input_ids = [values for values in batch['prompt_data_input_ids']]
                 concatenated_batch['_data_input_ids'] = _data_input_ids
-                
+
             if 'prompt_data_pixel_values' in batch:
                 pixel_values = [values for values in batch['prompt_data_pixel_values']]
                 concatenated_batch['_data_pixel_values'] = pixel_values
@@ -478,11 +512,12 @@ class DPOTrainer(PushToMsHubMixin, SwiftMixin, HFDPOTrainer):
 
             if 'prompt_data_images' in batch:
                 # images not in _data, we manually execute data collector here
-                concatenated_batch['_data_images'] = batch['prompt_data_images'].squeeze(1).repeat(2, 1, 1, 1).to(device=device)
-            
+                concatenated_batch['_data_images'] = batch['prompt_data_images'].squeeze(1).repeat(2, 1, 1,
+                                                                                                   1).to(device=device)
+
             if 'prompt_data_image_bound' in batch:
                 concatenated_batch['_data_image_bound'] = batch['prompt_data_image_bound']
-            
+
             if 'prompt_data_tgt_sizes' in batch:
                 concatenated_batch['_data_tgt_sizes'] = batch['prompt_data_tgt_sizes']
 

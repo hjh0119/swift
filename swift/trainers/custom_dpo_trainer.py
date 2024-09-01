@@ -3,8 +3,9 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 import torch
 from torch import nn
 from transformers import PreTrainedModel, Trainer
-from trl import DPOTrainer as HFDPOTrainer, DPOConfig
-from trl.trainer.utils import pad_to_length, DPODataCollatorWithPadding
+from trl import DPOConfig
+from trl import DPOTrainer as HFDPOTrainer
+from trl.trainer.utils import DPODataCollatorWithPadding, pad_to_length
 
 from swift.llm.utils.template import Template
 from swift.utils import get_logger
@@ -12,6 +13,7 @@ from .mixin import PushToMsHubMixin, SwiftMixin
 from .utils import build_tokenized_answer, patch_trl, sort_by_max_length, tokenize_row
 
 logger = get_logger()
+
 
 # Exp: convert tokenize_row func to support multi-processing
 class DPOTrainer(PushToMsHubMixin, SwiftMixin, HFDPOTrainer):
@@ -31,7 +33,7 @@ class DPOTrainer(PushToMsHubMixin, SwiftMixin, HFDPOTrainer):
             self.ref_model = None
         patch_trl(is_vision)
 
-        kwardata_collator = DPODataCollatorWithPadding(
+        data_collator = DPODataCollatorWithPadding(
             pad_token_id=self.tokenizer.pad_token_id,
             label_pad_token_id=args.label_pad_token_id,
             is_encoder_decoder=self.is_encoder_decoder,
@@ -46,10 +48,11 @@ class DPOTrainer(PushToMsHubMixin, SwiftMixin, HFDPOTrainer):
 
         # self.need_filter: bool = False
         kwargs['call_parent_init'] = False
-        Trainer.__init__(self, *args,**kwargs)
-        
+        Trainer.__init__(self, *args, **kwargs)
+
         # remove origin columns to resolve conflit in streaming mode
-        self.train_dataset = self.train_dataset.map(tokenize_row, num_proc=4,batch=True, remove_columns=self.column_name)
+        self.train_dataset = self.train_dataset.map(
+            tokenize_row, num_proc=4, batch=True, remove_columns=self.column_name)
         if self.eval_dataset is not None:
             self.eval_dataset = self.eval_dataset.remove_columns(self.column_names)
 
@@ -82,11 +85,10 @@ class DPOTrainer(PushToMsHubMixin, SwiftMixin, HFDPOTrainer):
         self.use_dpo_data_collator = True
         self.generate_during_eval = False
         self.ref_model = dpo_config.ref_model
-        self.is_encoder_decoder = False # TODO
-        
+        self.is_encoder_decoder = False  # TODO
+
         return dpo_config
-        
-        
+
     def train(self, *args, **kwargs) -> torch.Tensor:
         res = super().train(*args, **kwargs)
         for i in range(torch.cuda.device_count()):
