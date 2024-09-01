@@ -65,6 +65,13 @@ class DPOTrainer(PushToMsHubMixin, SwiftMixin, HFDPOTrainer):
             self.perf['memory'][f'cuda:{i}'] = f'{torch.cuda.max_memory_reserved(i)/1024/1024/1024:.2f}GiB'
         return res
 
+    def _convert_bfloat16_to_float32(self, data):
+        if isinstance(data, torch.Tensor) and data.dtype == torch.bfloat16:
+            return data.to(torch.float32)
+        elif isinstance(data, list):
+            return [self._convert_bfloat16_to_float32(item) for item in data]
+        return data
+        
     def tokenize_row(self, feature, model: Union[PreTrainedModel, nn.Module] = None) -> Dict:
 
         batch = {}
@@ -83,18 +90,19 @@ class DPOTrainer(PushToMsHubMixin, SwiftMixin, HFDPOTrainer):
                 if not self._data_keys:
                     self._data_keys = prompt_tokens['_data'].keys()
                 for key in prompt_tokens['_data'].keys():
-                    if key not in prompt_tokens:
-                        prompt_tokens[key] = prompt_tokens['_data'][key]
+                    prompt_tokens[key] = prompt_tokens['_data'][key]
+                    if isinstance(prompt_tokens[key], torch.Tensor):
+                        prompt_tokens[key] = prompt_tokens[key].tolist()
                 prompt_tokens.pop('_data')
 
             prompt_tokens.pop('labels', None)
 
             # convert bfloat16 to float32 to avoid conflict in mapping
-            if 'pixel_values' in prompt_tokens and prompt_tokens['pixel_values'].dtype == torch.bfloat16:
-                prompt_tokens['pixel_values'] = prompt_tokens['pixel_values'].to(torch.float32)
+            if 'pixel_values' in prompt_tokens:
+                prompt_tokens['pixel_values'] = self._convert_bfloat16_to_float32(prompt_tokens['pixel_values'])
 
-            if 'images' in prompt_tokens and prompt_tokens['images'].dtype == torch.bfloat16:
-                prompt_tokens['images'] = prompt_tokens['images'].to(torch.float32)
+            if 'images' in prompt_tokens:
+                prompt_tokens['images'] = self._convert_bfloat16_to_float32(prompt_tokens['images'])
 
             if 'attention_mask' not in prompt_tokens:
                 prompt_tokens['attention_mask'] = [1] * len(prompt_tokens['input_ids'])
@@ -301,23 +309,24 @@ class DPOTrainer(PushToMsHubMixin, SwiftMixin, HFDPOTrainer):
             if self._data_keys:
                 _data = [dict() for _ in range(batch_size)]
                 for k in self._data_keys:
-                    if k == 'input_ids':
-                        _data = [{**d, k: concatenated_batch['concatenated_input_ids'][i]} for i, d in enumerate(_data)]
-                    elif k == 'labels':
-                        _data = [{**d, k: concatenated_batch['concatenated_labels'][i]} for i, d in enumerate(_data)]
+                    tgt_k = f'_data_{k}' if k != 'labels' else 'concatenated_data_labels'
+                    # if k == 'input_ids':
+                    #     _data = [{**d, k: concatenated_batch['concatenated_data_input_ids'][i]} for i, d in enumerate(_data)]
+                    if k == 'labels':
+                        _data = [{**d, k: concatenated_batch['concatenated_data_labels'][i]} for i, d in enumerate(_data)]
                     # for vision related data, paired response share the same one
                     elif k == 'images':
                         # convert the dtype of the images that may be converted to float32 in tokenize_row
                         model_dtype = self.accelerator.unwrap_model(model).dtype
                         _data = [{
-                            **d, k: concatenated_batch[k][i // 2].to(model_dtype).unsqueeze(0)
+                            **d, k: concatenated_batch[tgt_k][i // 2].to(model_dtype).unsqueeze(0)
                         } for i, d in enumerate(_data)]
                     elif k == 'pixel_values':
                         # convert the dtype of the pixel values that may be converted to float32 in tokenize_row
                         model_dtype = self.accelerator.unwrap_model(model).dtype
-                        _data = [{**d, k: concatenated_batch[k][i // 2].to(model_dtype)} for i, d in enumerate(_data)]
+                        _data = [{**d, k: concatenated_batch[tgt_k][i // 2].to(model_dtype)} for i, d in enumerate(_data)]
                     else:
-                        _data = [{**d, k: concatenated_batch[k][i // 2]} for i, d in enumerate(_data)]
+                        _data = [{**d, k: concatenated_batch[tgt_k][i // 2]} for i, d in enumerate(_data)]
                     model_kwargs['_data'] = _data
 
             if 'images' in concatenated_batch:
@@ -337,8 +346,12 @@ class DPOTrainer(PushToMsHubMixin, SwiftMixin, HFDPOTrainer):
         if all_logits.shape[:2] != concatenated_batch['concatenated_labels'].shape[:2]:
             # for llava, the model returns logits for the entire sequence,
             # including the image tokens (placed before the text tokens)
-            seq_len = concatenated_batch['concatenated_labels'].shape[1]
-            all_logits = all_logits[:, -seq_len:]
+            logits_len, labels_len = all_logits.shape[1], concatenated_batch['concatenated_labels'].shape[1]
+            
+            if logits_len > labels_len:
+                all_logits = all_logits[:, -labels_len:]
+            else:
+                concatenated_batch['concatenated_labels'] = concatenated_batch['concatenated_labels'][:, -logits_len:]
 
         all_logps, size_completion = self.get_batch_logps(
             all_logits,
@@ -444,24 +457,35 @@ class DPOTrainer(PushToMsHubMixin, SwiftMixin, HFDPOTrainer):
         # patch here
         if is_vision_model:
             # for keys appear in _data, we leave data collector in hook
-            if 'prompt_pixel_values' in batch:
-                pixel_values = [values for values in batch['prompt_pixel_values']]
-                concatenated_batch['pixel_values'] = pixel_values
+            if 'prompt_data_input_ids' in batch:
+                _data_input_ids = [values for values in batch['prompt_data_input_ids']]
+                concatenated_batch['_data_input_ids'] = _data_input_ids
+                
+            if 'prompt_data_pixel_values' in batch:
+                pixel_values = [values for values in batch['prompt_data_pixel_values']]
+                concatenated_batch['_data_pixel_values'] = pixel_values
 
-            if 'prompt_image_flags' in batch:
-                image_flags = [torch.tensor(flags) for flags in batch['prompt_image_flags']]
-                concatenated_batch['image_flags'] = image_flags
+            if 'prompt_data_image_flags' in batch:
+                image_flags = [torch.tensor(flags) for flags in batch['prompt_data_image_flags']]
+                concatenated_batch['_data_image_flags'] = image_flags
 
-            if 'prompt_pixel_attention_mask' in batch:
-                pixel_attention_mask = [mask for mask in batch['pixel_attention_mask']]
-                concatenated_batch['pixel_attention_mask'] = pixel_attention_mask
+            if 'prompt_data_pixel_attention_mask' in batch:
+                pixel_attention_mask = [mask for mask in batch['prompt_data_pixel_attention_mask']]
+                concatenated_batch['_data_pixel_attention_mask'] = pixel_attention_mask
 
-            if 'prompt_image_sizes' in batch:
-                concatenated_batch['image_sizes'] = batch['prompt_image_sizes']
+            if 'prompt_data_image_sizes' in batch:
+                concatenated_batch['_data_image_sizes'] = batch['prompt_data_image_sizes']
 
-            if 'prompt_images' in batch:
+            if 'prompt_data_images' in batch:
                 # images not in _data, we manually execute data collector here
-                concatenated_batch['images'] = batch['prompt_images'].squeeze(1).repeat(2, 1, 1, 1).to(device=device)
+                concatenated_batch['_data_images'] = batch['prompt_data_images'].squeeze(1).repeat(2, 1, 1, 1).to(device=device)
+            
+            if 'prompt_data_image_bound' in batch:
+                concatenated_batch['_data_image_bound'] = batch['prompt_data_image_bound']
+            
+            if 'prompt_data_tgt_sizes' in batch:
+                concatenated_batch['_data_tgt_sizes'] = batch['prompt_data_tgt_sizes']
+
         return concatenated_batch
 
     @staticmethod
