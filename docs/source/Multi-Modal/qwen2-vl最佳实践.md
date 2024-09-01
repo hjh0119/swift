@@ -13,7 +13,7 @@ git clone https://github.com/modelscope/swift.git
 cd swift
 pip install -e .[llm]
 
-# 请关注这个PR: https://github.com/huggingface/transformers/pull/33177
+# 请关注这个ISSUE: https://github.com/QwenLM/Qwen2-VL/issues/12
 # pip install torch>=2.4
 pip install git+https://github.com/huggingface/transformers.git
 pip install pyav qwen_vl_utils
@@ -153,6 +153,33 @@ history: [['<img>http://modelscope-open.oss-cn-hangzhou.aliyuncs.com/images/road
 
 ## 微调
 
+### 图像OCR微调
+我们使用 latex-ocr-print 数据集进行微调，该数据集的任务是进行Latex OCR。您可以在 modelscope 上找到该数据集: [https://modelscope.cn/datasets/AI-ModelScope/LaTeX_OCR](https://modelscope.cn/datasets/AI-ModelScope/LaTeX_OCR)
+
+```bash
+# 单卡A10/3090可运行
+# GPU Memory: 20GB
+SIZE_FACTOR=8 MAX_PIXELS=602112 CUDA_VISIBLE_DEVICES=0 swift sft \
+  --model_type qwen2-vl-7b-instruct \
+  --model_id_or_path qwen/Qwen2-VL-7B-Instruct \
+  --sft_type lora \
+  --dataset latex-ocr-print#20000
+
+# 全参数训练并freeze vit
+# GPU Memory: 4 * 60GB
+CUDA_VISIBLE_DEVICES=0,1,2,3 NPROC_PER_NODE=4 swift sft \
+  --model_type qwen2-vl-7b-instruct \
+  --model_id_or_path qwen/Qwen2-VL-7B-Instruct \
+  --sft_type full \
+  --freeze_vit true \
+  --deepspeed default-zero2 \
+  --dataset latex-ocr-print#20000
+```
+
+微调后模型对验证集进行推理的示例（只训练了200个step）：
+
+![推理效果](../../resources/qwen2-vl/ocr_result.png)
+
 ### 图像描述微调
 
 我们使用 coco-en-mini 数据集进行微调，该数据集的任务是对图片内容进行描述。您可以在 modelscope 上找到该数据集: [https://modelscope.cn/datasets/modelscope/coco_2014_caption](https://modelscope.cn/datasets/modelscope/coco_2014_caption)
@@ -185,7 +212,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 NPROC_PER_NODE=4 swift sft \
 ![显存占用](../../resources/qwen2-vl/1.png)
 
 
-训练损失图（时间原因，只训练了200个step）：
+训练损失图（只训练了200个step）：
 
 ![训练损失](../../resources/qwen2-vl/loss.png)
 
@@ -252,5 +279,5 @@ NFRAMES=24 MAX_PIXELS=100352 CUDA_VISIBLE_DEVICES=0 swift infer \
     --load_dataset_config true --merge_lora true
 ```
 
-微调后模型对验证集进行推理的示例（时间原因，只训练了50个step）：
+微调后模型对验证集进行推理的示例（只训练了50个step）：
 ![推理效果](../../resources/qwen2-vl/4.png)

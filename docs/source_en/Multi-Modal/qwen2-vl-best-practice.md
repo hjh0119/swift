@@ -13,7 +13,7 @@ git clone https://github.com/modelscope/swift.git
 cd swift
 pip install -e .[llm]
 
-# Please pay attention to this PR: https://github.com/huggingface/transformers/pull/33177
+# Please pay attention to this ISSUE: https://github.com/QwenLM/Qwen2-VL/issues/12
 # pip install torch>=2.4
 pip install git+https://github.com/huggingface/transformers.git
 pip install pyav qwen_vl_utils
@@ -139,6 +139,23 @@ history: [['<img>http://modelscope-open.oss-cn-hangzhou.aliyuncs.com/images/road
 
 ## Fine-tuning
 
+### Image OCR fine-tuning
+We fine-tune using latex-ocr-printdataset, which aims to describe the content of images. You can find this dataset on ModelScope: [https://modelscope.cn/datasets/AI-ModelScope/LaTeX_OCR](https://modelscope.cn/datasets/AI-ModelScope/LaTeX_OCR)
+
+```bash
+# Single-card A10/3090 can run
+# GPU Memory: 20GB
+SIZE_FACTOR=8 MAX_PIXELS=602112 CUDA_VISIBLE_DEVICES=0 swift sft \
+  --model_type qwen2-vl-7b-instruct \
+  --model_id_or_path qwen/Qwen2-VL-7B-Instruct \
+  --sft_type lora \
+  --dataset latex-ocr-print#20000
+```
+
+Example of the model performing inference on the validation set after fine-tuning (only 200 steps were trained):
+
+![inference result](../../resources/qwen2-vl/ocr_result.png)
+
 ### Image Description Fine-tuning
 
 We fine-tune using the coco-en-mini dataset, which aims to describe the content of images. You can find this dataset on ModelScope: [https://modelscope.cn/datasets/modelscope/coco_2014_caption](https://modelscope.cn/datasets/modelscope/coco_2014_caption)
@@ -151,6 +168,16 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 NPROC_PER_NODE=4 swift sft \
   --sft_type lora \
   --dataset coco-en-mini#20000 \
   --deepspeed default-zero2
+
+# Full parameter training and freezing ViT
+# GPU Memory: 4 * 60GB
+CUDA_VISIBLE_DEVICES=0,1,2,3 NPROC_PER_NODE=4 swift sft \
+  --model_type qwen2-vl-7b-instruct \
+  --model_id_or_path qwen/Qwen2-VL-7B-Instruct \
+  --sft_type full \
+  --freeze_vit true \
+  --deepspeed default-zero2 \
+  --dataset latex-ocr-print#20000
 ```
 
 To use a custom dataset, simply specify it as follows:
@@ -173,7 +200,7 @@ GPU Memory Usage:
 ![GPU Memory Usage](../../resources/qwen2-vl/1.png)
 
 
-Training loss (only 200 steps were trained due to time constraints):
+Training loss (only 200 steps were trained):
 
 ![train loss](../../resources/qwen2-vl/loss.png)
 
@@ -240,5 +267,5 @@ NFRAMES=24 MAX_PIXELS=100352 CUDA_VISIBLE_DEVICES=0 swift infer \
     --load_dataset_config true --merge_lora true
 ```
 
-Example of the model performing inference on the validation set after fine-tuning: (only 50 steps were trained due to time constraints)
+Example of the model performing inference on the validation set after fine-tuning: (only 50 steps were trained)
 ![inference result](../../resources/qwen2-vl/4.png)
