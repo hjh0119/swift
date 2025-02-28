@@ -27,7 +27,7 @@ from ..mixin import SwiftMixin
 from .rlhf_mixin import RLHFTrainerMixin
 
 try:
-    from trl.extras.profiling import profiling_decorator
+    from trl.extras.profiling import profiling_decorator, profiling_context
 except ImportError:
     raise ImportError('Please install trl from source using: `pip install git+https://github.com/huggingface/trl.git`')
 
@@ -381,14 +381,15 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
         distributed_idx = self.round_robin(len(all_inputs), get_node_setting()[1] * self.args.num_infer_workers)
         if self.infer_rank >= 0:
             _input_slice = np.array(all_inputs)[distributed_idx[self.infer_rank]]
-            if self.args.async_generate:
-                self.async_infer(inputs, _input_slice, distributed_idx)
-                data_cache = self.queue.get()
-                inputs = data_cache.inputs
-                outputs = data_cache.outputs
-                distributed_idx = data_cache.distributed_idx
-            else:
-                outputs = self.engine.infer(_input_slice, self.request_config, use_tqdm=False)
+            with profiling_context(self, "generate"):
+                if self.args.async_generate:
+                    self.async_infer(inputs, _input_slice, distributed_idx)
+                    data_cache = self.queue.get()
+                    inputs = data_cache.inputs
+                    outputs = data_cache.outputs
+                    distributed_idx = data_cache.distributed_idx
+                else:
+                    outputs = self.engine.infer(_input_slice, self.request_config, use_tqdm=False)
         else:
             if self.args.async_generate:
                 self.queue.put(DataCache(inputs, [], distributed_idx))
@@ -455,14 +456,14 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 outputs['old_per_token_logps'] = self._get_per_token_logps(self.model, outputs)
             else:
                 outputs['old_per_token_logps'] = None
-
-            if self.beta == 0.0:
-                ref_per_token_logps = None
-            elif self.ref_model is not None:
-                ref_per_token_logps = self._get_per_token_logps(self.ref_model, outputs)
-            else:
-                with self.accelerator.unwrap_model(self.model).disable_adapter():
-                    ref_per_token_logps = self._get_per_token_logps(self.model, outputs)
+            with profiling_context(self, "ref_per_token_logps"):
+                if self.beta == 0.0:
+                    ref_per_token_logps = None
+                elif self.ref_model is not None:
+                    ref_per_token_logps = self._get_per_token_logps(self.ref_model, outputs)
+                else:
+                    with self.accelerator.unwrap_model(self.model).disable_adapter():
+                        ref_per_token_logps = self._get_per_token_logps(self.model, outputs)
 
         rewards_per_func = torch.zeros((len(inputs), len(self.reward_funcs)), device=device)
         completions = [example['messages'][-1]['content'] for example in inputs]
@@ -543,7 +544,8 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
             raise ValueError('The GRPOTrainer does not support returning outputs')
         # Compute the per-token log probabilities for the model
         completion_mask = inputs['completion_mask']
-        per_token_logps = self._get_per_token_logps(model, inputs)
+        with profiling_context(self, "_get_per_token_logps"):
+            per_token_logps = self._get_per_token_logps(model, inputs)
 
         # Compute the KL divergence between the model and the reference model
         if self.beta != 0.0:
