@@ -344,12 +344,17 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
         return [index_to_output[idx] for idx in sorted(index_to_output.keys())]
 
     def async_infer(self, inputs, inputs_slice, distributed_idx):
-        future: Future = self.executor.submit(
-            self.engine.infer, infer_requests=inputs_slice, request_config=self.request_config, use_tqdm=False)
-
-        def done(_self):
-            self.queue.put(DataCache(inputs, _self.result(), distributed_idx))
-
+        def _timed_infer():
+            with profiling_context(self, "generate"):  # <- 仅增加此行
+                return self.engine.infer(
+                    inputs_slice, self.request_config, use_tqdm=False)
+        
+        future: Future = self.executor.submit(_timed_infer)  # <- 替换调用方法
+        
+        def done(future):
+            outputs = future.result()
+            self.queue.put(DataCache(inputs, outputs, distributed_idx))
+        
         future.add_done_callback(done)
 
     def _prefetch(self, train_dataloader):
