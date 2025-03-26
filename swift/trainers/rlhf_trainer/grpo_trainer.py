@@ -164,7 +164,7 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
 
         use_vllm = args.use_vllm
         use_lmdeploy = args.use_lmdeploy
-
+        self.fast_infer = use_vllm or use_lmdeploy
         if self.args.tensor_parallel_size > 1 and self.multi_turn_func:
             import torch.distributed as dist
             rank, _, _, _ = get_dist_setting()
@@ -199,7 +199,7 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
         self.parameter_groups, self.parameter_groups_no_lora = self.split_batches()
         self.infer_device = None
 
-        if use_vllm or use_lmdeploy:
+        if self.fast_infer:
             if self.infer_rank >= 0:
                 fast_infer_device = self.args.vllm_device or self.args.lmdeploy_device
                 if fast_infer_device[0] == 'auto':
@@ -642,7 +642,7 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
             remove_response = True
             while len(inputs_slice) > 0:
                 request_config.n = 1
-                if self.infer_rank_tp_0 >= 0:
+                if self.infer_rank_tp_0 >= 0 or not self.fast_infer:
                     inputs = []
                     cnt = 0
                     for i, output in enumerate(results):
@@ -813,7 +813,7 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
 
         device = self.accelerator.device
         # Generate completions using either vLLM or regular generation
-        if self.args.use_vllm or self.args.use_lmdeploy:
+        if self.fast_infer:
             inputs, outputs = self._fast_infer(inputs)
             # Broadcast the completions from the main process to all processes, ensuring each process receives its
             # corresponding slice.
@@ -838,7 +838,7 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
             self.accelerator.process_index * len(inputs),
             (self.accelerator.process_index + 1) * len(inputs),
         )
-        if self.args.use_vllm or self.args.use_lmdeploy:
+        if self.fast_infer:
             outputs = outputs[process_slice]
 
         for i, output in enumerate(outputs):
