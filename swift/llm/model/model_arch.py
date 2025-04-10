@@ -68,6 +68,7 @@ class MLLMModelArch:
     valley = 'valley'
     gemma3_vision = 'gemma3_vision'
     mistral_2503 = 'mistral_2503'
+    kimi_vl = 'kimi_vl'
 
 
 class ModelArch(LLMModelArch, MLLMModelArch):

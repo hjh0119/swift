@@ -7,7 +7,7 @@ from swift.llm import TemplateType
 from ..constant import LLMModelType, MLLMModelType
 from ..model_arch import ModelArch
 from ..patcher import patch_output_clone, patch_output_to_input_device
-from ..register import Model, ModelGroup, ModelMeta, get_model_tokenizer_with_flash_attn, register_model
+from ..register import Model, ModelGroup, ModelMeta, get_model_tokenizer_with_flash_attn, register_model, get_model_tokenizer_multimodal
 from ..utils import ModelInfo, git_clone_github, use_submodel_func
 
 register_model(
@@ -295,4 +295,19 @@ register_model(
         architectures=['DeepseekV3ForCausalLM'],
         model_arch=ModelArch.deepseek_v2,
         requires=['transformers<4.49'],
+    ))
+
+register_model(
+    ModelMeta(
+        MLLMModelType.kimi_vl,
+        [
+            ModelGroup([
+                Model('moonshotai/Kimi-VL-A3B-Thinking', 'moonshotai/Kimi-VL-A3B-Thinking'),
+                Model('moonshotai/Kimi-VL-A3B-Instruct', 'moonshotai/Kimi-VL-A3B-Instruct'),
+            ]),
+        ],
+        TemplateType.kimi_vl,
+        get_model_tokenizer_multimodal,
+        model_arch=ModelArch.kimi_vl,
+        requires=['transformers>=4.48.2', 'blobfile'],
     ))
