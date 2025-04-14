@@ -137,6 +137,9 @@ def get_model_tokenizer_internvl(model_dir: str,
         use_submodel_func(model, 'language_model')
         patch_output_clone(model.language_model.get_input_embeddings())
 
+    if model is not None and model.language_model._tp_plan:
+        model._tp_plan = model.language_model._tp_plan
+
     return model, tokenizer
 
 
