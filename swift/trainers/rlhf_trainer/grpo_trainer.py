@@ -566,6 +566,16 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
         if self.infer_rank >= 0 and self.args.use_vllm and self.args.vllm_enable_prefix_caching:
             self.engine.engine.reset_prefix_cache()
 
+    @property
+    def _engine_infer_model(self):
+        assert self.use_fast_infer
+        if self.args.use_vllm:
+            return self.engine.inner_model
+        else:
+            # LMDeploy
+            return self.engine.engine.engine
+
+
     def _wait_queue(self):
         while self._queue.empty():
             time.sleep(0.01)
@@ -723,7 +733,9 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
 
         if self.args.sleep_level > 0 and self.infer_rank >= 0:
             if self.args.offload_model:
-                self.offload_model()
+                unwrapped_model = self.accelerator.unwrap_model(self.model)
+                self.offload_model(unwrapped_model)
+                self.offload_model(self._engine_infer_model)
             if self.args.offload_optimizer:
                 self.offload_optimizer()
             if self.args.gc_collect_after_offload:
@@ -1198,11 +1210,10 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
             return self.train_queue
 
     @torch.no_grad()
-    def offload_model(self):
+    def offload_model(self, model):
         if len(self.offload_modules) > 0:
             return
-        unwrapped_model = self.accelerator.unwrap_model(self.model)
-        for name, module in unwrapped_model.named_modules():
+        for name, module in model.named_modules():
             if isinstance(module, torch.nn.Embedding):
                 self.offload_modules[name] = module.weight.device
                 module.to('cpu')
