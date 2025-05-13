@@ -543,6 +543,15 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 all_inputs = infer_inputs
             else:
                 all_inputs = gather_object(infer_inputs)
+
+            local_input_length = len(infer_inputs)
+            if self.accelerator.is_main_process:
+                all_input_lengths = [len(inputs) for inputs in all_inputs]
+            else:
+                all_input_lengths = None
+
+            all_input_lengths = broadcast_object_list(all_input_lengths, from_process=0)
+
             if self.accelerator.is_main_process:
                 results: List[ChatCompletionResponse] = self._engine_infer(
                     infer_requests=all_inputs, request_config=request_config)
@@ -551,11 +560,9 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
             # Broadcast the results from the main process to all processes,
             # ensuring each process receives its corresponding slice.
             results = broadcast_object_list(results, from_process=0)
-            process_slice = slice(
-                self.accelerator.process_index * per_device_size,
-                (self.accelerator.process_index + 1) * per_device_size,
-            )
-            results = results[process_slice]
+            start_idx = sum(all_input_lengths[:self.accelerator.process_index])
+            end_idx = start_idx + all_input_lengths[self.accelerator.process_index]
+            results = results[start_idx:end_idx]
         else:
             # pt / vllm
             if self.vllm_tensor_parallel_size > 1:
