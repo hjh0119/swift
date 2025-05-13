@@ -610,6 +610,9 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
         results = self._infer(inputs, request_config, is_global_inputs)
 
         if not self.multi_turn_func:
+            per_device_size = len(inputs)
+            if is_global_inputs:
+                per_device_size //= self.accelerator.num_processes
             # Single-turn: combine completions with messages and retain the finish reason.
             outputs = []
             for i, output in enumerate(results):
@@ -622,7 +625,7 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 outputs.append(_choices)
             # flatten 2D list to 1D list
             outputs = [item for sublist in outputs for item in sublist]
-            assert len(outputs) == len(inputs)
+            assert len(outputs) == per_device_size
         else:
             # Multi-turn: continue to rollout until finished.
             orig_size = len(inputs)
