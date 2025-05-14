@@ -32,6 +32,7 @@ from trl.models import prepare_deepspeed
 from trl.trainer.grpo_trainer import nanmax, nanmin
 
 from swift.llm import InferRequest, MultiModelKeys, RequestConfig, RowPreprocessor, get_model_arch, to_device
+from swift.llm.infer.protocol import ChatCompletionResponse
 from swift.plugin import multi_turns, orms, rm_plugins
 from swift.utils import JsonlWriter, gc_collect, get_device, get_logger, is_vllm_available, is_wandb_available
 from ..mixin import SwiftMixin
@@ -526,8 +527,11 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
 
         return [index_to_output[idx] for idx in sorted(index_to_output.keys())]
 
-    def _infer(self, inputs: InputsType, request_config: RequestConfig, is_global_inputs: bool = False) -> OutputsType:
-        from swift.llm.infer.protocol import ChatCompletionResponse
+    def _infer(self,
+               inputs: InputsType,
+               request_config: RequestConfig,
+               is_global_inputs: bool = False,
+               gather_outputs: bool = True) -> OutputsType:
         request_config = copy(request_config)
         # keys from InferRequest
         per_device_size = len(inputs)
@@ -559,10 +563,13 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 results = [None] * len(all_inputs)
             # Broadcast the results from the main process to all processes,
             # ensuring each process receives its corresponding slice.
-            results = broadcast_object_list(results, from_process=0)
-            start_idx = sum(all_input_lengths[:self.accelerator.process_index])
-            end_idx = start_idx + all_input_lengths[self.accelerator.process_index]
-            results = results[start_idx:end_idx]
+            if gather_outputs:
+                results = broadcast_object_list(results, from_process=0)
+                start_idx = sum(all_input_lengths[:self.accelerator.process_index])
+                end_idx = start_idx + all_input_lengths[self.accelerator.process_index]
+                results = results[start_idx:end_idx]
+            else:
+                return results
         else:
             # pt / vllm
             if self.vllm_tensor_parallel_size > 1:
@@ -597,10 +604,25 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
 
         return results
 
+    def _process_results_with_inputs(self, inputs: InputsType, results: List[ChatCompletionResponse]) -> OutputsType:
+        outputs = []
+        for i, output in enumerate(results):
+            _choices = []
+            for choice in output.choices:
+                _input: Dict = deepcopy(inputs[i])
+                InferRequest.remove_response(_input['messages'])
+                _input['messages'].append({'role': 'assistant', 'content': choice.message.content})
+                _choices.append((_input['messages'], choice.finish_reason))
+            outputs.append(_choices)
+        # flatten 2D list to 1D list
+        outputs = [item for sublist in outputs for item in sublist]
+        return outputs
+
     def _infer_single_or_multi_turn(self,
                                     inputs: InputsType,
                                     request_config: RequestConfig,
-                                    is_global_inputs: bool = False) -> OutputsType:
+                                    is_global_inputs: bool = False,
+                                    gather_outputs: bool = True) -> Union[OutputsType, List[ChatCompletionResponse]]:
         """Perform multi-turn or single-turn inference
 
         Args:
@@ -614,25 +636,17 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
         """
 
         # infer first turn
-        results = self._infer(inputs, request_config, is_global_inputs)
+        results = self._infer(inputs, request_config, is_global_inputs, gather_outputs)
 
         if not self.multi_turn_func:
             per_device_size = len(inputs)
             if is_global_inputs:
                 per_device_size //= self.accelerator.num_processes
             # Single-turn: combine completions with messages and retain the finish reason.
-            outputs = []
-            for i, output in enumerate(results):
-                _choices = []
-                for choice in output.choices:
-                    _input: Dict = deepcopy(inputs[i])
-                    InferRequest.remove_response(_input['messages'])
-                    _input['messages'].append({'role': 'assistant', 'content': choice.message.content})
-                    _choices.append((_input['messages'], choice.finish_reason))
-                outputs.append(_choices)
-            # flatten 2D list to 1D list
-            outputs = [item for sublist in outputs for item in sublist]
-            assert len(outputs) == per_device_size
+            if gather_outputs:
+                return self._process_results_with_inputs(inputs, results)
+            else:
+                return results
         else:
             # Multi-turn: continue to rollout until finished.
             orig_size = len(inputs)
