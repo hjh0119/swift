@@ -748,6 +748,15 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
             self._move_model_to_vllm()
             self._last_loaded_step = self.state.global_step
 
+        if self.vllm_mode == 'server':
+            all_inputs = gather_object(inputs)
+            if self.async_generate:
+                pass # TODO
+            else:
+                if self.accelerator.is_main_process:
+                    outputs = self._infer_single_or_multi_turn(inputs, self.request_config)
+
+
         if self.async_generate:
             # send this step data to server
             # we gather inputs outside the thread for prevent potential gather deadlock
