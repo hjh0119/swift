@@ -752,11 +752,19 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
             # send this step data to server
             # we gather inputs outside the thread for prevent potential gather deadlock
             all_inputs = gather_object(inputs)
-            self.async_infer(all_inputs)
-            # get last step data from cache
-            data_cache = self._queue.get()
-            inputs = data_cache.inputs
-            outputs = data_cache.outputs
+            if self.accelerator.is_main_process:
+                self.async_infer(all_inputs)
+                data_cache = self._queue.get()
+                # cached data from last step
+                inputs = data_cache.inputs
+                outputs = data_cache.outputs
+            else:
+                inputs = []
+                outputs = []
+            
+            outputs = self.gather_and_slice_object(outputs)
+            inputs = self.gather_and_slice_object(inputs)
+
         else:
             with self.multi_turn_completion_length_context():
                 outputs = self._infer_single_or_multi_turn(inputs, self.request_config)
@@ -770,6 +778,30 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
             if self.args.offload_optimizer:
                 self.load_optimizer()
         return inputs, outputs
+
+    def gather_and_slice_object(self, input_data):
+        """
+        Gathers input data from all processes and slices the collected data 
+        based on the current process's index.
+
+        Args:
+            input_data (list or similar): The input data to be gathered from each process.
+
+        Returns:
+            list: A slice of the gathered data corresponding to the current process's workload.
+        """
+
+        # Gather data from all processes into a single list
+        gathered_data = gather_object(input_data)
+        
+        # Calculate the slice range for the current process
+        process_slice = slice(
+            self.accelerator.process_index * len(gathered_data),
+            (self.accelerator.process_index + 1) * len(gathered_data),
+        )
+        
+        # Return the portion of the gathered data assigned to this process
+        return gathered_data[process_slice]
 
     def _generate_completions(self, inputs: InputsType) -> InputsType:
         """Generate completions for given inputs using either fast inference or standard PyTorch inference.
