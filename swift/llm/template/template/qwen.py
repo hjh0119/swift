@@ -148,6 +148,11 @@ class QwenAudioTemplate(Template):
 
     def _encode(self, inputs: StdTemplateInputs) -> Dict[str, Any]:
         encoded = super()._encode(inputs)
+
+        audios = inputs.audios
+        if audios:
+            for audio in audios:
+
         text = ''.join([f'<audio>{audio}</audio>' for audio in inputs.audios])
         audio_info = self.processor.process_audio(text)
         if audio_info:
