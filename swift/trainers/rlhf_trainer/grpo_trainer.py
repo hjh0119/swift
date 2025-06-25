@@ -1111,8 +1111,10 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 if self.ref_model is not None:
                     ref_per_token_logps = self._get_per_token_logps(self.ref_model, inputs)
                 else:
-                    with self.accelerator.unwrap_model(self.model).disable_adapter():
-                        ref_per_token_logps = self._get_per_token_logps(self.model, inputs)
+                    with self.accelerator.unwrap_model(self.model) as unwrapped_model:
+                        gc_context = nullcontext if self.args.gradient_checkpointing else self.peft_model_disable_gc_context  # noqa
+                        with unwrapped_model.disable_adapter(), gc_context(unwrapped_model):
+                            ref_per_token_logps = self._get_per_token_logps(self.model, inputs)
 
             per_token_kl = (
                 torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1)
@@ -1576,3 +1578,17 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
         ]
 
         return infer_requests
+
+    @contextmanager
+    def peft_model_disable_gc_context(self, model):
+        """
+        Disables gradient checkpointing for a PEFT model during ref model inference.
+
+        Args:
+            model: The model to disable gradient checkpointing on.
+        """
+
+        assert is_peft_model(model)
+        model.base_model.gradient_checkpointing_disable()
+        yield
+        model.base_model.gradient_checkpointing_enable()
