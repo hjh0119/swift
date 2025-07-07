@@ -91,6 +91,11 @@ class MathTipsMultiTurnScheduler(MultiTurnScheduler):
         infer_request.messages.append({'role': 'user', 'content': self.tips_prompt})
         return infer_request
 
+class ReToolScheduler(MultiTurnScheduler):
+
+    def __init__(self, max_turns = None, *args, **kwargs):
+        super().__init__(max_turns, *args, **kwargs)
+        from e2b import
 
 multi_turns = {
     'math_tip_trick': MathTipsScheduler,
