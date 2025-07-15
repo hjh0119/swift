@@ -338,6 +338,8 @@ class Template(ProcessorMixin):
         chosen_inputs, rejected_inputs = inputs, deepcopy(inputs)
         assert chosen_inputs.rejected_response is not None, f'inputs: {inputs}'
         rejected_inputs.messages[-1]['content'] = chosen_inputs.rejected_response
+        if chosen_inputs.rejected_images:
+            rejected_inputs.images = chosen_inputs.rejected_images
         chosen_encoded = self._encode_truncated(chosen_inputs)
         rejected_encoded = self._encode_truncated(rejected_inputs)
 
