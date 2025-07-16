@@ -165,7 +165,6 @@ class SwiftRolloutDeploy(SwiftPipeline):
         safe_set_start_method()
         self.app = FastAPI(lifespan=self.lifespan)
         self._register_rl_rollout_app()
-        self.master_port = get_open_port()
         self.connections = []
         self.processes = []
         self._start_data_parallel_workers()
