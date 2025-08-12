@@ -1,0 +1,19 @@
+# 76GiB
+CUDA_VISIBLE_DEVICES=0 \
+swift sft \
+    --model Qwen/Qwen2.5-Math-1.5B \
+    --train_type full \
+    --dataset AI-MO/NuminaMath-CoT#100000 \
+    --torch_dtype bfloat16 \
+    --enable_dft_loss true \
+    --num_train_epochs 1 \
+    --per_device_train_batch_size 16 \
+    --learning_rate 5e-5 \
+    --gradient_accumulation_steps 16 \
+    --save_total_limit 2 \
+    --logging_steps 5 \
+    --max_length 2048 \
+    --output_dir output \
+    --system 'You are a helpful assistant.' \
+    --warmup_ratio 0.1 \
+    --dataloader_num_workers 4
