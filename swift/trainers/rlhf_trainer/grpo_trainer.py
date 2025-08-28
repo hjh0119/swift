@@ -588,8 +588,8 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
                         [state.shape != torch.Size([0]) for state in state_dict.values()])
 
                     if self.vllm_mode == 'server' and self.accelerator.is_main_process:
-                        for name, param in state_dict.items():
-                            self.vllm_client.update_named_param(name, param)
+                        # 使用批量更新方法，减少HTTP请求次数
+                        self.vllm_client.update_model_params_batch(state_dict)
                     elif self.vllm_mode == 'colocate':
                         llm_model = self.engine.inner_model
                         llm_model.load_weights(state_dict.items())
@@ -597,13 +597,22 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
                         self.model.unmerge_adapter()
                     del state_dict
         else:
-            for name, param in self.model.named_parameters():
-                with gather_if_zero3([param]):
-                    if self.vllm_mode == 'server' and self.accelerator.is_main_process:
-                        self.vllm_client.update_named_param(name, param.data)
-                    elif self.vllm_mode == 'colocate':
-                        llm_model = self.engine.inner_model
-                        llm_model.load_weights([(name, param.data)])
+            if self.vllm_mode == 'server' and self.accelerator.is_main_process:
+                # 收集所有参数，然后批量更新
+                state_dict = {}
+                for name, param in self.model.named_parameters():
+                    with gather_if_zero3([param]):
+                        state_dict[name] = param.data
+                # 使用批量更新方法
+                self.vllm_client.update_model_params_batch(state_dict)
+            elif self.vllm_mode == 'colocate':
+                # 对于colocate模式，收集所有参数后批量加载
+                weights_to_load = []
+                for name, param in self.model.named_parameters():
+                    with gather_if_zero3([param]):
+                        weights_to_load.append((name, param.data))
+                llm_model = self.engine.inner_model
+                llm_model.load_weights(weights_to_load)
 
         if self.vllm_mode == 'server' and self.accelerator.is_main_process:
             self.vllm_client.reset_prefix_cache()

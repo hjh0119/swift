@@ -246,6 +246,55 @@ class VLLMClient:
         for name, param in model.named_parameters():
             self.update_named_param(name, param.data)
 
+    def update_model_params_batch(self, state_dict: dict):
+        """
+        批量更新模型参数，减少HTTP请求次数和NCCL通信开销
+        
+        Args:
+            state_dict (dict): 包含参数名和对应张量的字典
+        """
+        if not state_dict:
+            return
+            
+        # 收集所有参数信息
+        param_info = []
+        for name, param in state_dict.items():
+            param_info.append({
+                'name': name,
+                'dtype': str(param.dtype),
+                'shape': tuple(param.shape)
+            })
+        
+        errors = [None] * self.num_servers
+
+        def _update_batch_single_server(i):
+            try:
+                # 发送批量参数信息
+                response = self.sessions[i].post(
+                    f'{self.base_urls[i]}/update_params_batch/',
+                    json={'params': param_info}
+                )
+                if response.status_code != 200:
+                    raise Exception(f'Server {i} batch update failed: {response.text}')
+
+                # 批量广播权重
+                for name, param in state_dict.items():
+                    self.pynccl_comms[i].broadcast(param, src=self.pynccl_comms[i].rank)
+                
+                # 等待所有参数广播完成后再同步
+                self.pynccl_comms[i].group.barrier()
+            except Exception as e:
+                errors[i] = e
+
+        with ThreadPoolExecutor(max_workers=self.num_servers) as executor:
+            futures = [executor.submit(_update_batch_single_server, i) for i in range(self.num_servers)]
+            for future in futures:
+                future.result()
+
+        all_errors = [e for e in errors if e is not None]
+        if all_errors:
+            raise RuntimeError(f'Multiple errors in batch update: {all_errors}')
+
     def reset_prefix_cache(self):
         errors = [None] * self.num_servers
 
