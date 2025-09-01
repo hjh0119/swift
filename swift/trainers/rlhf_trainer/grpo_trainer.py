@@ -725,6 +725,9 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
 
     def _prefetch(self, dataloader: DataLoader):
         inputs = next(iter(dataloader))
+        if self.template.truncation_strategy == 'raise':
+            inputs = self.resample_encode_failed_inputs(inputs)
+        inputs = self._preprocess_inputs(inputs)
         all_inputs = gather_object(inputs)
         if self.state.global_step != self._last_loaded_step:
             self._move_model_to_vllm(skip_async_check=True)
@@ -818,12 +821,14 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
             inputs = self.resample_encode_failed_inputs(inputs)
 
         inputs = self._generate_completions(inputs)
-        total_advantages, rewards_std = self._score_completions(inputs)
+        total_advantages, rewards_std, total_rewards_per_func = self._score_completions(inputs)
         mode = 'train' if self.model.training else 'eval'
 
         if self.args.dynamic_sample and mode == 'train':
             # dynamic sampling for std=0 groups
-            inputs, total_advantages = self._dynamic_sampling(inputs, total_advantages, rewards_std)  # noqa
+            inputs, total_advantages, total_rewards_per_func = self._dynamic_sampling(inputs, total_advantages, rewards_std, total_rewards_per_func)  # noqa
+        # Log rewards data when not using dynamic sampling
+        self._log_rewards_data(total_rewards_per_func, total_prompt_ids, total_request_ids)
 
         local_advantages = self.get_even_process_data(total_advantages)
         assert len(local_advantages) == len(inputs)
@@ -883,6 +888,7 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
         Returns:
             Tuple containing:
             - advantages: Tensor of shape (num_examples,) with computed advantages
+            - rewards_per_func: Tensor of shape (num_examples, num_reward_funcs) with all reward values
             - rewards_std: Tensor of shape (num_examples,) with group standard deviations
         """
         device = self.accelerator.device
@@ -913,7 +919,7 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
         total_advantages, total_rewards_std = self._compute_advantages(total_rewards_per_func, total_prompt_ids,
                                                                        total_request_ids)
 
-        return total_advantages, total_rewards_std
+        return total_advantages, total_rewards_per_func, total_rewards_std
 
     def _compute_rewards_per_func(self, inputs: DataType) -> torch.Tensor:
         """Compute rewards using all reward functions"""
@@ -984,31 +990,6 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
                 return advantages / (rewards_std + 1e-4)
             return advantages
 
-        def log_rewards_metrics(rewards: torch.Tensor, rewards_per_func_for_metrics: torch.Tensor):
-            """Log reward statistics for monitoring. Only log once per unique request_id."""
-            # rewards: [prompt_batch_size, self.num_generations]
-            # rewards_per_func_for_metrics: [prompt_batch_size*self.num_generations, self.num_reward_funcs]
-            mode = 'train' if self.model.training else 'eval'
-            group_rewards = rewards.view(-1, self.num_generations)
-            rewards_mean = group_rewards.mean(-1).mean().item()
-            rewards_std = group_rewards.std(-1).mean().item()
-            is_std_zero = torch.isclose(rewards.std(dim=0), torch.zeros_like(rewards.std(dim=0)))
-
-            self._metrics[mode]['reward'].append(rewards_mean)
-            self._metrics[mode]['reward_std'].append(rewards_std)
-            self._metrics[mode]['frac_reward_zero_std'].append(is_std_zero.float().mean().item())
-
-            # Log per-reward-function statistics using deduplicated rewards_per_func
-            for i, name in enumerate(self.reward_func_names):
-                col = rewards_per_func_for_metrics[:, i]
-                self._metrics[mode][f'rewards/{name}/mean'].append(torch.nanmean(col).item())
-                self._metrics[mode][f'rewards/{name}/std'].append(nanstd(col).item())
-
-        def log_rewards_all(rewards_per_func: torch.Tensor):
-            """Log all rewards for debugging."""
-            for i, name in enumerate(self.reward_func_names):
-                self._logs['rewards'][name].extend(rewards_per_func[:, i].tolist())
-
         # Step 0. Aggregate final reward using reward weights
         device = self.accelerator.device
         if not self.use_gym_env:
@@ -1032,11 +1013,7 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
             advantages = rewards - group_rewards_mean
             advantages = normalize_advantages(advantages, group_rewards_std)
 
-            # Log metrics once per group
-            log_rewards_metrics(rewards=grouped_rewards, rewards_per_func_for_metrics=rewards_per_func)
 
-            # Log all rewards
-            log_rewards_all(rewards_per_func)
 
             return advantages, group_rewards_std
 
@@ -1083,13 +1060,77 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
             advantages = request_advantages[indices_in_unique]
             rewards_std = prompt_stds[indices_in_unique]
 
-            # Step 5. Log metrics for unique request_ids
-            log_rewards_metrics(rewards=unique_rewards, rewards_per_func_for_metrics=rewards_per_func[unique_indices])
 
-            # Step 6. Log all rewards
-            log_rewards_all(rewards_per_func)
 
             return advantages, rewards_std
+
+    def _log_rewards_data(self, rewards_per_func: torch.Tensor, prompt_ids: Optional[List[str]] = None, 
+                          request_ids: Optional[List[str]] = None):
+        """
+        Log reward statistics and data for monitoring.
+        
+        Args:
+            rewards_per_func: Reward values for each reward function
+            prompt_ids: Prompt identifiers for each sample
+            request_ids: Request identifiers for each sample
+        """
+        def log_rewards_metrics(rewards: torch.Tensor, rewards_per_func_for_metrics: torch.Tensor):
+            """Log reward statistics for monitoring. Only log once per unique request_id."""
+            # rewards: [prompt_batch_size, self.num_generations]
+            # rewards_per_func_for_metrics: [prompt_batch_size*self.num_generations, self.num_reward_funcs]
+            mode = 'train' if self.model.training else 'eval'
+            group_rewards = rewards.view(-1, self.num_generations)
+            rewards_mean = group_rewards.mean(-1).mean().item()
+            rewards_std = group_rewards.std(-1).mean().item()
+            is_std_zero = torch.isclose(rewards.std(dim=0), torch.zeros_like(rewards.std(dim=0)))
+
+            self._metrics[mode]['reward'].append(rewards_mean)
+            self._metrics[mode]['reward_std'].append(rewards_std)
+            self._metrics[mode]['frac_reward_zero_std'].append(is_std_zero.float().mean().item())
+
+            # Log per-reward-function statistics using deduplicated rewards_per_func
+            for i, name in enumerate(self.reward_func_names):
+                col = rewards_per_func_for_metrics[:, i]
+                self._metrics[mode][f'rewards/{name}/mean'].append(torch.nanmean(col).item())
+                self._metrics[mode][f'rewards/{name}/std'].append(nanstd(col).item())
+
+        def log_rewards_all(rewards_per_func: torch.Tensor):
+            """Log all rewards for debugging."""
+            for i, name in enumerate(self.reward_func_names):
+                self._logs['rewards'][name].extend(rewards_per_func[:, i].tolist())
+
+        # Step 0. Aggregate final reward using reward weights
+        device = self.accelerator.device
+        if not self.use_gym_env:
+            rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
+        else:
+            rewards = rewards_per_func.squeeze(1)
+
+        # --------------------------------------------------
+        # Case 1: Default grouped mode
+        # --------------------------------------------------
+        if not prompt_ids or not request_ids:
+            grouped_rewards = rewards.view(-1, self.num_generations)
+            # Log metrics once per group
+            log_rewards_metrics(rewards=grouped_rewards, rewards_per_func_for_metrics=rewards_per_func)
+            # Log all rewards
+            log_rewards_all(rewards_per_func)
+
+        # --------------------------------------------------
+        # Case 2: Request-aware mode
+        # --------------------------------------------------
+        else:
+            assert self.dynamic_num_samples
+            assert rewards.shape[0] == len(prompt_ids) == len(request_ids)
+            
+            # Step 1. Deduplicate request_ids
+            unique_indices = self._get_last_indices(request_ids)
+            unique_rewards = rewards[unique_indices]
+            
+            # Log metrics for unique request_ids
+            log_rewards_metrics(rewards=unique_rewards, rewards_per_func_for_metrics=rewards_per_func[unique_indices])
+            # Log all rewards
+            log_rewards_all(rewards_per_func)
 
     @patch_profiling_decorator
     def _dynamic_sampling(self, inputs, advantages, rewards_std):
@@ -2299,6 +2340,13 @@ class GRPOTrainer(RLHFTrainerMixin, SwiftMixin, HFGRPOTrainer):
             outputs_count = gather_object(outputs_count)[0]  # Broadcast count to all processes
             if outputs_count != len(all_requests):
                 self.dynamic_num_samples = True
+                if self.args.dynamic_sample:
+                    logger.warning(
+                        "Mismatch between returned samples and requests detected. "
+                        "With --dynamic_sample enabled, only the last valid sample of each "
+                        f"{self.args.generation_batch_size}-sized batch will be kept; "
+                        "some requests may therefore be dropped."
+                    )
             # Initialize empty outputs for non-main processes
             if not self.accelerator.is_main_process:
                 all_outputs = [None] * outputs_count
