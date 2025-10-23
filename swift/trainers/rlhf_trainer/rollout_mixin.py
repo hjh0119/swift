@@ -37,6 +37,8 @@ from .utils import (FlattenedTensorBucket, TensorLoRARequest, _create_parameter_
                     _process_bucket_with_flattened_tensor, get_even_process_data, get_gather_if_zero3_context,
                     patch_lora_merge, patch_lora_unmerge, patch_profiling_context, patch_profiling_decorator,
                     patch_vllm_load_adapter, set_expandable_segments)
+from .vllm_weight_sharing import (get_vllm_model_weights, init_training_model_with_vllm_weights,
+                                  is_weight_sharing_enabled, patch_vllm_for_weight_sharing, verify_weight_sharing)
 
 DataType = List[Dict[str, Union[torch.Tensor, Any]]]
 logger = get_logger()
@@ -125,9 +127,15 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
         self.enable_server_multi_turn = False
         self.rollout_enable_lora = False
         self.vllm_use_async_engine = False
+        self.enable_weight_sharing = getattr(args, 'enable_weight_sharing', False)
 
         if not args.use_vllm:
             return
+
+        # Apply vLLM patches for weight sharing if enabled
+        if self.enable_weight_sharing and self.vllm_mode == 'colocate':
+            logger.info('[GRPO] Enabling weight sharing between training and vLLM models')
+            patch_vllm_for_weight_sharing()
 
         # split model parameters into batches for synchronized weight transfer
         self.parameter_groups, self.parameter_groups_no_lora = self.split_batches()
@@ -233,7 +241,43 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
             )
             set_expandable_segments(True)
 
+        # Initialize weight sharing after vLLM engine is created
+        if self.enable_weight_sharing:
+            self._init_weight_sharing(engine)
+
         return engine
+
+    def _init_weight_sharing(self, engine):
+        """Initialize weight sharing between training model and vLLM model"""
+        try:
+            logger.info('[Weight Sharing] Initializing weight sharing...')
+
+            # Get vLLM model weights
+            vllm_weights = get_vllm_model_weights(engine)
+            if not vllm_weights:
+                logger.error('[Weight Sharing] Failed to get vLLM weights, disabling weight sharing')
+                self.enable_weight_sharing = False
+                return
+
+            # Initialize training model to reference vLLM weights
+            is_lora = self.args.train_type == 'lora' and self.rollout_enable_lora
+            shared_count, total_count = init_training_model_with_vllm_weights(self.model, vllm_weights, is_lora=is_lora)
+
+            if shared_count == 0:
+                logger.error('[Weight Sharing] No weights were shared, disabling weight sharing')
+                self.enable_weight_sharing = False
+                return
+
+            # Verify weight sharing
+            if verify_weight_sharing(self.model, engine, check_count=3):
+                logger.info(f'[Weight Sharing] Successfully initialized weight sharing: '
+                            f'{shared_count}/{total_count} parameters')
+            else:
+                logger.warning('[Weight Sharing] Verification failed, but continuing with weight sharing enabled')
+
+        except Exception as e:
+            logger.error(f'[Weight Sharing] Failed to initialize weight sharing: {e}', exc_info=True)
+            self.enable_weight_sharing = False
 
     def split_batches(self):
         """Split model parameters into batches for synchronized weight transfer.
@@ -350,6 +394,14 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
 
         if args.async_generate and not skip_async_check:
             self._wait_queue()
+
+        # Skip weight transfer if weight sharing is enabled
+        if self.enable_weight_sharing:
+            logger.debug('[Weight Sharing] Skipping weight transfer (models share memory)')
+            # Only need to sync LoRA adapters if using vLLM LoRA mode
+            if args.train_type == 'lora' and self.rollout_enable_lora and self.base_sync_done:
+                self._move_adapter_to_vllm()
+            return
 
         train_type = args.train_type
 
@@ -633,11 +685,21 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
         args = self.args
         assert isinstance(args, RolloutTrainerArgumentsMixin)
 
+        # Wake up vLLM model before inference
         if self.vllm_mode == 'colocate' and args.sleep_level > 0:
             if self.engine.inner_model_executor.is_sleeping:
                 wake_up_params = inspect.signature(self.engine.engine.wake_up).parameters
-                kwargs = {'tags': ['weights']} if 'tags' in wake_up_params else {}
-                self.engine.engine.wake_up(**kwargs)
+                supports_tags = 'tags' in wake_up_params
+
+                if self.enable_weight_sharing and supports_tags:
+                    # In weight sharing mode, weights never sleep
+                    # Only need to wake up KV cache
+                    logger.debug('[Weight Sharing] Waking up KV cache only')
+                    self.engine.engine.wake_up(tags=['kv_cache'])
+                else:
+                    # Standard wake-up (all memory)
+                    kwargs = {'tags': ['weights']} if supports_tags else {}
+                    self.engine.engine.wake_up(**kwargs)
 
         if self.state.global_step != self._last_loaded_step:
             self._move_model_to_vllm()
@@ -646,8 +708,12 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
         context = self.offload_context if self.enable_offload else nullcontext
         with context():
             set_expandable_segments(False)
+
+            # Wake up KV cache if needed (after weight sync)
             if (self.vllm_mode == 'colocate' and self.engine.inner_model_executor.is_sleeping
-                    and 'tags' in inspect.signature(self.engine.engine.wake_up).parameters):
+                    and 'tags' in inspect.signature(self.engine.engine.wake_up).parameters
+                    and not self.enable_weight_sharing):
+                # Only do this in non-weight-sharing mode (already done above in weight sharing mode)
                 self.engine.engine.wake_up(tags=['kv_cache'])
 
             if hasattr(self, 'async_generate') and self.async_generate:
