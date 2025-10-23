@@ -92,8 +92,6 @@ class RolloutArguments(DeployArguments):
     gym_env: Optional[str] = None
     context_manager: Optional[str] = None
 
-    enable_weight_sharing: bool = False  # exp feature: weight sharing between training and vLLM model
-
     def __post_init__(self):
         self._check_trl_version()
         super().__post_init__()

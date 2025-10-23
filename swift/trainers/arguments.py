@@ -260,6 +260,8 @@ class RolloutTrainerArgumentsMixin(VllmArguments):
     vllm_enable_prefix_caching: bool = True  # overwrite
     vllm_enable_lora: bool = False
     lora_rank: int = 8  # for vllm lora adapter
+    enable_weight_sharing: bool = False  # exp feature: weight sharing between training and vLLM model
+
     # external vllm (server)
     vllm_server_base_url: Optional[List[str]] = None
     vllm_server_host: Optional[List[str]] = None

@@ -249,14 +249,6 @@ def init_training_model_with_vllm_weights(training_model: torch.nn.Module,
     total_count = 0
 
     # Build mapping from base parameter names to vLLM weights
-    # Handle potential prefix differences (e.g., "base_model.model." for PEFT)
-    vllm_weight_map = {}
-    for vllm_name, vllm_tensor in vllm_weights.items():
-        # Store both with and without common prefixes
-        vllm_weight_map[vllm_name] = vllm_tensor
-        # Remove model. prefix if present
-        if vllm_name.startswith('model.'):
-            vllm_weight_map[vllm_name[6:]] = vllm_tensor
 
     for name, param in training_model.named_parameters():
         total_count += 1
@@ -277,8 +269,8 @@ def init_training_model_with_vllm_weights(training_model: torch.nn.Module,
         vllm_tensor = None
         matched_name = None
         for candidate in vllm_name_candidates:
-            if candidate in vllm_weight_map:
-                vllm_tensor = vllm_weight_map[candidate]
+            if candidate in vllm_weights:
+                vllm_tensor = vllm_weights[candidate]
                 matched_name = candidate
                 break
 
