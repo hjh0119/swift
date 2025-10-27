@@ -328,6 +328,9 @@ class GRPOArgumentsMixin(RolloutTrainerArgumentsMixin):
     generation_batch_size: Optional[int] = None
     steps_per_generation: Optional[int] = None
 
+    # cispo https://arxiv.org/abs/2506.13585
+    enable_cispo_loss: bool = False
+
     # dataset
     dataset_shuffle: Optional[bool] = True
 

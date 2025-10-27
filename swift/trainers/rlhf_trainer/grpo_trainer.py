@@ -1727,6 +1727,9 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
         # GSPO, https://www.arxiv.org/abs/2507.18071
         self.importance_sampling_level = args.importance_sampling_level
 
+        # cispo, https://arxiv.org/abs/2506.13585
+        self.enable_cispo_loss = args.enable_cispo_loss
+
         # CHORD, https://arxiv.org/abs/2508.11408
         self.chord_sft_iterator = None
         if self.chord_sft_dataset:
