@@ -91,8 +91,8 @@ class MegatronGRPOTrainer(MegatronRLHFTrainer):
 
         # Dr. GRPO / RLOO / REINFORCE++
         self.scale_rewards = args.scale_rewards
-        self.advantage_estimator = args.advantage_estimator  # TODO
-        self.kl_in_reward = args.kl_in_reward  # TODO
+        self.advantage_estimator = args.advantage_estimator
+        self.kl_in_reward = args.kl_in_reward
 
         # Entropy mask settings, TODO
         self.log_entropy = args.log_entropy
@@ -492,71 +492,30 @@ class MegatronGRPOTrainer(MegatronRLHFTrainer):
         if self.dynamic_sample:
             rollout_batch, rewards_per_func = self._dynamic_sampling(rollout_batch, rewards_per_func)
 
-        advantages = self._compute_advantages(rollout_batch, rewards_per_func)
-
-        def _get_encoded_batch(rollout_batch, advantages):
-            template = self.template
-            with self._template_context(template):
-                encoded_batch = [template.encode(data, return_length=True) for data in rollout_batch]
-                encoded_batch = to_device(
-                    template.data_collator(encoded_batch, padding_to=get_padding_to(args)), self.device)
-            labels = encoded_batch['labels']
-            assert self.template.padding_free
-            position_ids = encoded_batch.get('text_position_ids')
-            if position_ids is None:
-                position_ids = encoded_batch.get('position_ids')
-            squeezed_position_ids = position_ids.squeeze()
-            assert squeezed_position_ids is not None
-            # Remove trailing padding zeros from position_ids to avoid interference
-            # Find the last non-zero position
-            last_nonzero_idx = (squeezed_position_ids != 0).nonzero(as_tuple=True)[0]
-            if len(last_nonzero_idx) > 0:
-                # Keep only up to the last non-zero position + 1 to include the last valid position
-                squeezed_position_ids = squeezed_position_ids[:last_nonzero_idx[-1] + 1]
-
-            # Calculate lengths based on sequence boundaries (position_ids == 0)
-            lengths = torch.diff(
-                torch.cat([(squeezed_position_ids == 0).nonzero(as_tuple=True)[0],
-                           torch.tensor([len(squeezed_position_ids)]).to(squeezed_position_ids.device)]))
-            advantages = torch.repeat_interleave(advantages, lengths)
-            truncated_mask = torch.tensor([b['is_truncated'] for b in rollout_batch],
-                                          dtype=torch.bool,
-                                          device=self.device)
-            truncated_mask = torch.repeat_interleave(truncated_mask, lengths).unsqueeze(0)
-            padding_length = labels.shape[1] - truncated_mask.shape[1]
-            if padding_length > 0:
-                padding = torch.zeros((1, padding_length), device=truncated_mask.device, dtype=truncated_mask.dtype)
-                truncated_mask = torch.cat([truncated_mask, padding], dim=1)
-            # Pad advantages to match the original position_ids length
-            original_length = position_ids.shape[1]
-            if advantages.shape[0] < original_length:
-                padding_length = original_length - advantages.shape[0]
-                padding = torch.zeros(padding_length, device=advantages.device, dtype=advantages.dtype)
-                advantages = torch.cat([advantages, padding])
-
-            completion_mask = labels != -100
-            encoded_batch.update({
-                'completion_mask': completion_mask,
-                'truncated_mask': truncated_mask,
-                'advantages': advantages,
-                'num_samples': len(rollout_batch),
-                'seq_lengths': lengths,
-            })
-
-            return encoded_batch
-
-        # Step2: ref/old logps
+        # Step2: Gather data and prepare batch inputs (encode + compute old/ref logps)
         total_batch = gather_object(rollout_batch, group=rollout_group)
-        total_advantages = gather(advantages, group=rollout_group)
-        mini_batch_data = []
 
+        # Encode all data and compute old/ref logps BEFORE computing advantages
+        batch_encoded_inputs_for_advantages = []
         for idx in range(0, len(total_batch), self.micro_batch_size):
             micro_batch_data = total_batch[idx:idx + self.micro_batch_size]
             micro_batch_data = self._maybe_replace_response_token(micro_batch_data)
-            micro_batch_advantages = total_advantages[idx:idx + self.micro_batch_size]
-            micro_batch_data = _get_encoded_batch(micro_batch_data, micro_batch_advantages)
+            micro_batch_data = self._get_encoded_batch_simple(micro_batch_data)
             with profiling_context(self, 'compute_ref_old_logps'):
                 micro_batch_data = self._maybe_compute_logps(micro_batch_data)
+            batch_encoded_inputs_for_advantages.append(micro_batch_data)
+
+        # Step3: Compute advantages (with KL from rewards if kl_in_reward=True)
+        advantages = self._compute_advantages(rollout_batch, rewards_per_func, batch_encoded_inputs_for_advantages)
+        total_advantages = gather(advantages, group=rollout_group)
+
+        # Step4: Prepare final batch inputs with advantages added
+        mini_batch_data = []
+        for idx in range(0, len(total_batch), self.micro_batch_size):
+            micro_batch_advantages = total_advantages[idx:idx + self.micro_batch_size]
+            # Reuse the already encoded data and add advantages
+            micro_batch_data = batch_encoded_inputs_for_advantages[idx // self.micro_batch_size]
+            micro_batch_data = self._add_advantages_to_batch(micro_batch_data, micro_batch_advantages)
             mini_batch_data.append(micro_batch_data)
 
         if self.loss_type in ['cispo', 'dapo']:
@@ -812,7 +771,70 @@ class MegatronGRPOTrainer(MegatronRLHFTrainer):
 
         return rewards_per_func
 
-    def _compute_advantages(self, batch: DataType, rewards_per_func: torch.Tensor) -> torch.Tensor:
+    def _get_encoded_batch_simple(self, rollout_batch):
+        """Encode batch without adding advantages (used for KL computation)."""
+        template = self.template
+        with self._template_context(template):
+            encoded_batch = [template.encode(data, return_length=True) for data in rollout_batch]
+            encoded_batch = to_device(
+                template.data_collator(encoded_batch, padding_to=get_padding_to(get_args())), self.device)
+
+        labels = encoded_batch['labels']
+        assert self.template.padding_free
+        position_ids = encoded_batch.get('text_position_ids')
+        if position_ids is None:
+            position_ids = encoded_batch.get('position_ids')
+        squeezed_position_ids = position_ids.squeeze()
+        assert squeezed_position_ids is not None
+
+        # Remove trailing padding zeros from position_ids
+        last_nonzero_idx = (squeezed_position_ids != 0).nonzero(as_tuple=True)[0]
+        if len(last_nonzero_idx) > 0:
+            squeezed_position_ids = squeezed_position_ids[:last_nonzero_idx[-1] + 1]
+
+        # Calculate lengths based on sequence boundaries
+        lengths = torch.diff(
+            torch.cat([(squeezed_position_ids == 0).nonzero(as_tuple=True)[0],
+                       torch.tensor([len(squeezed_position_ids)]).to(squeezed_position_ids.device)]))
+
+        truncated_mask = torch.tensor([b['is_truncated'] for b in rollout_batch], dtype=torch.bool, device=self.device)
+        truncated_mask = torch.repeat_interleave(truncated_mask, lengths).unsqueeze(0)
+        padding_length = labels.shape[1] - truncated_mask.shape[1]
+        if padding_length > 0:
+            padding = torch.zeros((1, padding_length), device=truncated_mask.device, dtype=truncated_mask.dtype)
+            truncated_mask = torch.cat([truncated_mask, padding], dim=1)
+
+        completion_mask = labels != -100
+        encoded_batch.update({
+            'completion_mask': completion_mask,
+            'truncated_mask': truncated_mask,
+            'num_samples': len(rollout_batch),
+            'seq_lengths': lengths,
+        })
+
+        return encoded_batch
+
+    def _add_advantages_to_batch(self, encoded_batch: Dict[str, Any], advantages: torch.Tensor) -> Dict[str, Any]:
+        """Add advantages to an already encoded batch."""
+        position_ids = encoded_batch.get('text_position_ids')
+        if position_ids is None:
+            position_ids = encoded_batch.get('position_ids')
+
+        lengths = encoded_batch['seq_lengths']
+        advantages_expanded = torch.repeat_interleave(advantages, lengths)
+
+        # Pad advantages to match the original position_ids length
+        original_length = position_ids.shape[1]
+        if advantages_expanded.shape[0] < original_length:
+            padding_length = original_length - advantages_expanded.shape[0]
+            padding = torch.zeros(padding_length, device=advantages_expanded.device, dtype=advantages_expanded.dtype)
+            advantages_expanded = torch.cat([advantages_expanded, padding])
+
+        encoded_batch['advantages'] = advantages_expanded
+        return encoded_batch
+
+    def _compute_advantages(self, batch: DataType, rewards_per_func: torch.Tensor,
+                            batch_encoded_inputs: List[Dict[str, Any]]) -> torch.Tensor:
         """Compute advantages for RL training."""
 
         def normalize_advantages(advantages: torch.Tensor, rewards_std: torch.Tensor) -> torch.Tensor:
@@ -825,29 +847,74 @@ class MegatronGRPOTrainer(MegatronRLHFTrainer):
         assert len(batch) == rewards_per_func.shape[0]
         total_rewards_per_func = gather(rewards_per_func)
         rewards = (total_rewards_per_func * self.reward_weights.unsqueeze(0)).nansum(dim=1)
+
+        # Add KL penalty to rewards if kl_in_reward is enabled
+        if self.kl_in_reward and self.beta != 0.0:
+            # Use the already encoded data to compute KL
+            kl_list = []
+            for batch_encoded in batch_encoded_inputs:
+                # Compute KL from already computed logps
+                old_per_token_logps = batch_encoded['old_per_token_logps']
+                ref_per_token_logps = batch_encoded['ref_per_token_logps']
+                completion_mask = batch_encoded['completion_mask']
+                if self.template.padding_free:
+                    lengths = batch_encoded['seq_lengths']
+                    per_token_kl = torch.split(old_per_token_logps - ref_per_token_logps, lengths.tolist(), dim=1)
+                    completion_masks = torch.split(completion_mask, lengths.tolist(), dim=1)
+                    kl = torch.cat([(kl * mask).sum(-1) for kl, mask in zip(per_token_kl, completion_masks)])
+                else:
+                    per_token_kl = old_per_token_logps - ref_per_token_logps
+                    kl = (per_token_kl * completion_mask).sum(-1)
+                kl_list.append(kl)
+
+            kl = torch.cat(kl_list, dim=0)
+            self._metrics[mode]['kl'].append(kl.nanmean().item())
+            rewards = rewards - self.beta * kl
+
         grouped_rewards = rewards.view(-1, self.num_generations)
+        K = self.num_generations
 
         # Compute group statistics
         group_rewards_mean = grouped_rewards.mean(dim=1)
 
         # Broadcast stats back to the original shape
-        group_rewards_mean = group_rewards_mean.repeat_interleave(self.num_generations)
+        group_rewards_mean = group_rewards_mean.repeat_interleave(K)
 
-        # Compute advantages relative to group mean
-        advantages = rewards - group_rewards_mean
+        # Compute advantages based on estimation type
+        if self.advantage_estimator == 'rloo':
+            # RLOO: Leave-One-Out baseline
+            # A_i = r_i - mean(r_j for j != i)
+            # = r_i * K/(K-1) - mean_all * K/(K-1)
+            advantages = rewards * K / (K - 1) - group_rewards_mean * K / (K - 1)
+        else:  # 'grpo' or 'reinforce_plus_plus'
+            # Both use group mean as baseline
+            advantages = rewards - group_rewards_mean
 
-        # Normalize advantages based on scale_rewards setting
-        if self.scale_rewards == 'batch':
-            # Global batch-level normalization
-            rewards_std = rewards.std().expand_as(rewards)
-        elif self.scale_rewards == 'group':
-            # Group-level normalization (default)
-            rewards_std = grouped_rewards.std(dim=1).repeat_interleave(self.num_generations)
-        else:  # 'none'
-            rewards_std = None
-
-        if rewards_std is not None:
-            advantages = normalize_advantages(advantages, rewards_std)
+        # Normalize advantages based on estimator and scale_rewards
+        if self.advantage_estimator == 'reinforce_plus_plus':
+            # REINFORCE++: Use std of advantages (not rewards)
+            if self.scale_rewards == 'batch':
+                # Global whitening: std computed on advantages
+                # Note: advantages.mean() is mathematically 0, no need to subtract
+                advantages_std = advantages.std().expand_as(advantages)
+            elif self.scale_rewards == 'group':
+                # Group-level whitening on advantages
+                advantages_grouped = advantages.view(-1, K)
+                advantages_std = advantages_grouped.std(dim=1).repeat_interleave(K)
+            else:  # 'none'
+                advantages_std = None
+            if advantages_std is not None:
+                advantages = normalize_advantages(advantages, advantages_std)
+        else:  # 'grpo' or 'rloo'
+            # GRPO/RLOO: Use std of original rewards
+            if self.scale_rewards == 'batch':
+                rewards_std = rewards.std().expand_as(rewards)
+            elif self.scale_rewards == 'group':
+                rewards_std = grouped_rewards.std(dim=1).repeat_interleave(K)
+            else:  # 'none'
+                rewards_std = None
+            if rewards_std is not None:
+                advantages = normalize_advantages(advantages, rewards_std)
 
         def log_rewards_metrics(rewards: torch.Tensor, rewards_per_func_for_metrics: torch.Tensor):
             """Log reward statistics for monitoring. Only log once per unique request_id."""
@@ -966,7 +1033,7 @@ class MegatronGRPOTrainer(MegatronRLHFTrainer):
                 batch['ref_per_token_logps'] = self.model_forward(
                     ref_model, iter([deepcopy(inputs)]), no_grad=True, per_token=True)['logps']
 
-        if not self.on_policy:
+        if not self.on_policy or self.kl_in_reward:
             batch['old_per_token_logps'] = self.model_forward(
                 self.unwrapped_models[0], iter([deepcopy(inputs)]), no_grad=True, per_token=True)['logps']
         return batch
@@ -1064,10 +1131,13 @@ class MegatronGRPOTrainer(MegatronRLHFTrainer):
                 logger.warning('All completions are truncated in this batch. Loss and grad_norm will be 0. '
                                'Consider increasing max_completion_length')
 
-        if self.beta != 0.0:
+        # Compute KL divergence for loss if kl_in_reward=False (GRPO style)
+        if self.beta != 0.0 and not self.kl_in_reward:
             ref_per_token_logps = data.get('ref_per_token_logps')
             per_token_kl = (
                 torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1)
+        else:
+            per_token_kl = None
 
         old_per_token_logps = (
             per_token_logps.detach() if data.get('old_per_token_logps') is None else data['old_per_token_logps'])
@@ -1134,7 +1204,7 @@ class MegatronGRPOTrainer(MegatronRLHFTrainer):
             per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
         else:
             raise ValueError(f'Unknown loss type: {self.loss_type}')
-        if self.beta != 0.0:
+        if per_token_kl is not None:
             per_token_loss = per_token_loss + self.beta * per_token_kl
 
         if self.loss_type == 'grpo':
@@ -1172,7 +1242,7 @@ class MegatronGRPOTrainer(MegatronRLHFTrainer):
             'completions/min_length': total_lengths.float().min(),
         }
 
-        if self.beta != 0.0:
+        if per_token_kl is not None:
             # Unified processing (no CP-specific logic needed)
             kl_value = (per_token_kl * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
             avg_metric['kl'] = kl_value.clone().detach()
