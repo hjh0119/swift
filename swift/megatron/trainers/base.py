@@ -1032,7 +1032,7 @@ class BaseMegatronTrainer(ABC):
     def _prepare_batch(self, data, vp_stage, num_samples=None):
         batch = get_batch_on_this_tp_rank(data, vp_stage=vp_stage)
         if num_samples is None:
-            num_samples = batch.pop('num_samples')
+            num_samples = batch.pop('num_samples', None)
         args = get_args()
         text_position_ids = batch.pop('text_position_ids', None)
         batch.pop('attention_mask_2d', None)
@@ -1041,6 +1041,9 @@ class BaseMegatronTrainer(ABC):
         if args.padding_free and text_position_ids is not None:
             batch['packed_seq_params'] = get_packed_seq_params(text_position_ids)
             batch['packed_seq_params'].num_samples = num_samples
+        else:
+            if num_samples is not None:
+                batch['num_samples'] = num_samples
         # slice batch along sequence dimension for context parallelism
         batch = get_batch_on_this_cp_rank(batch)
         return batch

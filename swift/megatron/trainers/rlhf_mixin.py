@@ -61,22 +61,33 @@ class MegatronRLHFTrainer(BaseMegatronTrainer):
         per_token_logps = -output_tensor
         loss_mask = labels != -100
         per_token_logps = per_token_logps * loss_mask
+
+        # Check if we're in padding_free mode (packed_seq_params is not None)
+        is_padding_free = self.template.padding_free
         if per_token:
-            # In CP mode, all_gather and reconstruct full sequence
-            if args.context_parallel_size > 1:
-                per_token_logps = self._postprocess_packed_tensor_cp(per_token_logps, packed_seq_params, num_samples
-                                                                     or packed_seq_params.num_samples)
+            if is_padding_free:
+                # padding_free mode: In CP mode, all_gather and reconstruct full sequence
+                if args.context_parallel_size > 1:
+                    per_token_logps = self._postprocess_packed_tensor_cp(per_token_logps, packed_seq_params, num_samples
+                                                                         or packed_seq_params.num_samples)
+            # non-padding_free mode: per_token_logps is already [batch_size, seq_len]
             return per_token_logps
 
-        if num_samples is None:
-            num_samples = packed_seq_params.num_samples * 2
-        cu_seqlens = packed_seq_params.cu_seqlens_q[:num_samples + 1] // args.context_parallel_size
-        all_logps = per_token_logps.new_zeros((num_samples, ))
-        for i in range(num_samples):
-            start, end = cu_seqlens[i], cu_seqlens[i + 1]
-            all_logps[i] = per_token_logps[:, start:end].sum()
-        if args.context_parallel_size > 1:
-            all_logps = all_reduce(all_logps, group=mpu.get_context_parallel_group())
+        if is_padding_free:
+            # padding_free mode: use cu_seqlens to compute per-sample logps
+            if num_samples is None:
+                num_samples = packed_seq_params.num_samples * 2
+            cu_seqlens = packed_seq_params.cu_seqlens_q[:num_samples + 1] // args.context_parallel_size
+            all_logps = per_token_logps.new_zeros((num_samples, ))
+            for i in range(num_samples):
+                start, end = cu_seqlens[i], cu_seqlens[i + 1]
+                all_logps[i] = per_token_logps[:, start:end].sum()
+            if args.context_parallel_size > 1:
+                all_logps = all_reduce(all_logps, group=mpu.get_context_parallel_group())
+        else:
+            # non-padding_free mode: per_token_logps is [batch_size, seq_len]
+            # sum along sequence dimension to get per-sample logps
+            all_logps = per_token_logps.sum(dim=-1)  # [batch_size]
         return all_logps
 
     def _postprocess_packed_tensor_cp(self, tensor, packed_seq_params, num_samples):

@@ -525,34 +525,43 @@ class MegatronGRPOTrainer(MegatronRLHFTrainer):
 
         def _get_encoded_batch(rollout_batch):
             template = self.template
+            is_padding_free = template.padding_free
             with self._template_context(template):
                 encoded_list = [template.encode(data, return_length=True) for data in rollout_batch]
                 encoded_batch = to_device(
                     template.data_collator(encoded_list, padding_to=get_padding_to(args)), self.device)
-                if 'cu_seq_lens_q' in encoded_batch:
-                    cu_seq_lens_q = encoded_batch['cu_seq_lens_q']
-                else:
-                    cu_seq_lens_q = get_packed_seq_params(encoded_batch['position_ids'])['cu_seq_lens_q']
-                seq_lengths = cu_seq_lens_q[1:] - cu_seq_lens_q[:-1]
 
             labels = encoded_batch['labels']
             batch_size = len(rollout_batch)
-            max_seq_len = seq_lengths.max().item()
-            assert self.template.padding_free
 
             truncated_mask = torch.tensor([b['is_truncated'] for b in rollout_batch],
                                           dtype=torch.bool,
                                           device=self.device)
 
-            # completion_mask in rmpad format [1, total_tokens]
-            completion_mask_rmpad = (labels != -100).float()
-            completion_mask, _ = pad_logps_back_to_batch(
-                logps_rmpad=completion_mask_rmpad,
-                logits_to_keep=max_seq_len,
-                batch_size=batch_size,
-                seq_lengths=seq_lengths,
-                pad_value=0.0)
-            completion_mask = completion_mask.bool()
+            if is_padding_free:
+                # padding_free mode: labels shape is [1, total_tokens] (rmpad format)
+                if 'cu_seq_lens_q' in encoded_batch:
+                    cu_seq_lens_q = encoded_batch['cu_seq_lens_q']
+                else:
+                    cu_seq_lens_q = get_packed_seq_params(encoded_batch['position_ids'])['cu_seq_lens_q']
+                seq_lengths = cu_seq_lens_q[1:] - cu_seq_lens_q[:-1]
+                max_seq_len = seq_lengths.max().item()
+
+                # completion_mask in rmpad format [1, total_tokens]
+                completion_mask_rmpad = (labels != -100).float()
+                completion_mask, _ = pad_logps_back_to_batch(
+                    logps_rmpad=completion_mask_rmpad,
+                    logits_to_keep=max_seq_len,
+                    batch_size=batch_size,
+                    seq_lengths=seq_lengths,
+                    pad_value=0.0)
+                completion_mask = completion_mask.bool()
+            else:
+                # non-padding_free mode: labels shape is [batch_size, seq_len] (batch format)
+                max_seq_len = labels.shape[1]
+                seq_lengths = (labels != -100).sum(dim=-1)  # [batch_size]
+                # completion_mask is already [batch_size, seq_len]
+                completion_mask = (labels != -100)
 
             encoded_batch.update({
                 'completion_mask': completion_mask,  # [batch_size, max_seq_len]
@@ -1087,28 +1096,37 @@ class MegatronGRPOTrainer(MegatronRLHFTrainer):
         seq_lengths = batch['seq_lengths']
         batch_size = batch['num_samples']
         max_seq_len = batch['completion_mask'].shape[1]
+        is_padding_free = self.template.padding_free
 
         inputs = self._prepare_model_inputs(batch)
         if self.beta != 0.0:
             with torch.no_grad(), self.null_ref_context() as ref_models:
                 assert len(ref_models) == 1, 'GRPO currently does not support VPP.'
                 ref_model = ref_models[0]
-                ref_per_token_logps_rmpad = self.model_forward(
+                ref_per_token_logps_raw = self.model_forward(
                     ref_model, iter([deepcopy(inputs)]), no_grad=True, per_token=True)['logps']
-                ref_per_token_logps, _ = pad_logps_back_to_batch(
-                    logps_rmpad=ref_per_token_logps_rmpad,
-                    logits_to_keep=max_seq_len,
-                    batch_size=batch_size,
-                    seq_lengths=seq_lengths)
+                if is_padding_free:
+                    ref_per_token_logps, _ = pad_logps_back_to_batch(
+                        logps_rmpad=ref_per_token_logps_raw,
+                        logits_to_keep=max_seq_len,
+                        batch_size=batch_size,
+                        seq_lengths=seq_lengths)
+                else:
+                    # non-padding_free mode: logps is already [batch_size, seq_len]
+                    ref_per_token_logps = ref_per_token_logps_raw
                 batch['ref_per_token_logps'] = ref_per_token_logps
 
-        old_per_token_logps_rmpad = self.model_forward(
+        old_per_token_logps_raw = self.model_forward(
             self.unwrapped_models[0], iter([deepcopy(inputs)]), no_grad=True, per_token=True)['logps']
-        old_per_token_logps, _ = pad_logps_back_to_batch(
-            logps_rmpad=old_per_token_logps_rmpad,
-            logits_to_keep=max_seq_len,
-            batch_size=batch_size,
-            seq_lengths=seq_lengths)
+        if is_padding_free:
+            old_per_token_logps, _ = pad_logps_back_to_batch(
+                logps_rmpad=old_per_token_logps_raw,
+                logits_to_keep=max_seq_len,
+                batch_size=batch_size,
+                seq_lengths=seq_lengths)
+        else:
+            # non-padding_free mode: logps is already [batch_size, seq_len]
+            old_per_token_logps = old_per_token_logps_raw
         batch['old_per_token_logps'] = old_per_token_logps
 
         return batch
@@ -1219,25 +1237,40 @@ class MegatronGRPOTrainer(MegatronRLHFTrainer):
         advantages = data['advantages']  # [batch_size]
         labels = data['labels']
         completion_mask = data['completion_mask']  # [batch_size, max_seq_len]
-        packed_seq_params = data['packed_seq_params']
+        packed_seq_params = data.get('packed_seq_params')
         truncated_mask = data['truncated_mask']  # [batch_size]
         seq_lengths = data['seq_lengths']  # [batch_size]
         max_seq_len = completion_mask.shape[1]
         micro_batch_size = self.micro_batch_size
+        is_padding_free = self.template.padding_free
 
-        # Use full sequence lengths directly (get_logps returns full sequences in CP mode)
-        lengths = packed_seq_params.cu_seqlens_q[1:micro_batch_size
-                                                 + 1] - packed_seq_params.cu_seqlens_q[:micro_batch_size]
+        if is_padding_free:
+            # padding_free mode: Use full sequence lengths from packed_seq_params
+            lengths = packed_seq_params.cu_seqlens_q[1:micro_batch_size
+                                                     + 1] - packed_seq_params.cu_seqlens_q[:micro_batch_size]
+            num_samples = packed_seq_params.num_samples
+        else:
+            # non-padding_free mode: Use attention_mask to compute lengths
+            attention_mask = data.get('attention_mask')
+            if attention_mask is not None:
+                lengths = attention_mask.sum(dim=-1)  # [batch_size]
+            else:
+                lengths = seq_lengths
+            num_samples = micro_batch_size
 
-        # get_logps with per_token=True returns rmpad format [1, total_tokens]
-        # Pad to batch format [batch_size, max_seq_len]
-        per_token_logps_rmpad = self.get_logps(
-            output_tensor, labels, packed_seq_params, packed_seq_params.num_samples, per_token=True)
-        per_token_logps, _ = pad_logps_back_to_batch(
-            logps_rmpad=per_token_logps_rmpad,
-            logits_to_keep=max_seq_len,
-            batch_size=micro_batch_size,
-            seq_lengths=seq_lengths)
+        # get_logps with per_token=True:
+        # - padding_free mode: returns rmpad format [1, total_tokens], need to pad
+        # - non-padding_free mode: returns batch format [batch_size, seq_len]
+        per_token_logps_raw = self.get_logps(output_tensor, labels, packed_seq_params, num_samples, per_token=True)
+        if is_padding_free:
+            per_token_logps, _ = pad_logps_back_to_batch(
+                logps_rmpad=per_token_logps_raw,
+                logits_to_keep=max_seq_len,
+                batch_size=micro_batch_size,
+                seq_lengths=seq_lengths)
+        else:
+            # non-padding_free mode: logps is already [batch_size, seq_len]
+            per_token_logps = per_token_logps_raw
 
         # Get pre-padded ref/old/rollout logps from data
         ref_per_token_logps = data.get('ref_per_token_logps')  # [batch_size, max_seq_len] or None
@@ -1452,9 +1485,10 @@ class MegatronGRPOTrainer(MegatronRLHFTrainer):
         context = torch.no_grad() if no_grad else nullcontext()
         with context:
             output_tensor = forward_step_helper(model, data)
-        packed_seq_params = data['packed_seq_params']
+        packed_seq_params = data.get('packed_seq_params')
+        num_samples = packed_seq_params.num_samples if packed_seq_params is not None else data['num_samples']
         data['logps'] = None if labels is None else self.get_logps(
-            output_tensor, labels, data['packed_seq_params'], packed_seq_params.num_samples, per_token=per_token)
+            output_tensor, labels, packed_seq_params, num_samples, per_token=per_token)
         return data
 
     @contextmanager
