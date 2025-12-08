@@ -315,16 +315,25 @@ class MultiTurnScheduler(RolloutScheduler, ABC):
             current_request: 'RolloutInferRequest' = ret['infer_request']
 
             # Track response tokens and masks
-            return_token_id = False
+            # If step() doesn't return response_token_ids and doesn't return response_loss_mask,
+            # use response_choice.token_ids as default to ensure consistency with rollout_logprobs
             if 'response_token_ids' in ret:
+                current_token_ids = ret['response_token_ids']
+            elif 'response_loss_mask' not in ret:
+                # Only use default when no custom loss_mask is provided
+                current_token_ids = list(response_choice.token_ids) if response_choice.token_ids else None
+            else:
+                current_token_ids = None
+
+            if current_token_ids:
                 if is_continuation and total_response_ids:
-                    total_response_ids[-1].extend(ret['response_token_ids'])
+                    total_response_ids[-1].extend(current_token_ids)
                 else:
-                    total_response_ids.append(ret['response_token_ids'])
-                return_token_id = True
+                    total_response_ids.append(current_token_ids)
 
             if 'response_loss_mask' in ret:
-                assert return_token_id, 'You must return response_token_ids if you want to return response_loss_mask'
+                assert 'response_token_ids' in ret, \
+                    'You must return response_token_ids with response_loss_mask return'
                 assert len(ret['response_loss_mask']) == len(ret['response_token_ids']), \
                     'response_loss_mask must have the same length as response_token_ids'
                 if is_continuation and total_response_loss_mask:

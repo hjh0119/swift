@@ -2086,6 +2086,8 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
             'importance_sampling_level': str(self.importance_sampling_level),
             'advantage_estimator': str(self.advantage_estimator),
             'chord_sft_enabled': str(self.chord_sft_dataset is not None),
+            'loss_type': str(self.loss_type),
+            'rollout_importance_sampling_mode': str(self.rollout_importance_sampling_mode),
         }
         return config
 

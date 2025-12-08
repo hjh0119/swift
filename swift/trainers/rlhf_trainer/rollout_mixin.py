@@ -665,16 +665,28 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
                 is_continuation = is_continuations[index]
                 step_result = self.multi_turn_scheduler.step(requests[index], output.response.choices[0], current_turn)
                 current_request: RolloutInferRequest = step_result['infer_request']
+                response_choice = output.response.choices[0]
+
                 # Track response tokens and masks
-                return_token_id = False
+                # If step() doesn't return response_token_ids and doesn't return response_loss_mask,
+                # use response_choice.token_ids as default to ensure consistency with rollout_logprobs
                 if 'response_token_ids' in step_result:
+                    current_token_ids = step_result['response_token_ids']
+                elif 'response_loss_mask' not in step_result:
+                    # Only use default when no custom loss_mask is provided
+                    current_token_ids = list(response_choice.token_ids) if response_choice.token_ids else None
+                else:
+                    current_token_ids = None
+
+                if current_token_ids:
                     if is_continuation and response_token_ids[index]:
-                        response_token_ids[index][-1].extend(step_result['response_token_ids'])
+                        response_token_ids[index][-1].extend(current_token_ids)
                     else:
-                        response_token_ids[index].append(step_result['response_token_ids'])
-                    return_token_id = True
+                        response_token_ids[index].append(current_token_ids)
+
                 if 'response_loss_mask' in step_result:
-                    assert return_token_id, 'You must return response_token_ids with response_loss_mask return'
+                    assert 'response_token_ids' in step_result, \
+                        'You must return response_token_ids with response_loss_mask return'
                     assert len(step_result['response_loss_mask']) == len(step_result['response_token_ids']), \
                         'response_loss_mask must have the same length as response_token_ids'
                     if is_continuation and response_loss_mask[index]:
@@ -692,7 +704,7 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
                 if 'rollout_logprobs' in step_result and step_result['rollout_logprobs']:
                     current_logprobs = step_result['rollout_logprobs']
                 else:
-                    current_logprobs = self._extract_logprobs_from_choice(output.response.choices[0])
+                    current_logprobs = self._extract_logprobs_from_choice(response_choice)
                 if current_logprobs:
                     if is_continuation and rollout_logprobs[index]:
                         rollout_logprobs[index][-1].extend(current_logprobs)
