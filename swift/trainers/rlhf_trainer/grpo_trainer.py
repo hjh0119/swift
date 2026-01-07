@@ -367,17 +367,28 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
             async def _invoke_async_reward(index):
                 func = self.reward_funcs[index]
                 func_name = self.reward_func_names[index]
-                with patch_profiling_context(self, func_name):
-                    output = await func(completions, **reward_kwargs)
-                    output = [r if r is not None else torch.nan for r in output]
-                    return index, output
+                try:
+                    with patch_profiling_context(self, func_name):
+                        output = await func(completions, **reward_kwargs)
+                        output = [r if r is not None else torch.nan for r in output]
+                        return index, output
+                except Exception as e:
+                    logger.error(f'Async reward function {func_name} failed: {e}', exc_info=True)
+                    raise  # Re-raise to propagate to main thread
 
             async def _run_async_funcs():
                 # Maintain order by processing indices in sequence
                 coros = [_invoke_async_reward(idx) for idx in self._async_reward_func_indices]
-                return await asyncio.gather(*coros)
+                return await asyncio.gather(*coros, return_exceptions=False)
 
-            async_results = asyncio.run_coroutine_threadsafe(_run_async_funcs(), self.async_reward_loop).result()
+            # Execute async reward functions and propagate exceptions (fail-fast)
+            future = asyncio.run_coroutine_threadsafe(_run_async_funcs(), self.async_reward_loop)
+            try:
+                async_results = future.result(timeout=300.0)  # 5 minute timeout
+            except Exception as e:
+                logger.critical(f'FAIL-FAST: Async reward computation failed: {e}', exc_info=True)
+                raise RuntimeError(f'Async reward function failed: {e}') from e
+
             for idx, output_reward_func in async_results:
                 rewards_per_func[:, idx] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
 
@@ -1845,7 +1856,8 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
             # Wait for the eval rollout to complete
             while not self.is_async_generate_eval_rollout_done():
                 time.sleep(0.1)
-        return super().training_step(model, inputs, num_items_in_batch)
+        loss = super().training_step(model, inputs, num_items_in_batch)
+        return loss
 
     def old_policy(self):
         if self.template.sequence_parallel_size == 1:

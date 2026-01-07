@@ -15,6 +15,8 @@ if TYPE_CHECKING:
     from .rlhf_mixin import RLHFTrainerMixin
     from .utils import patch_lora_merge, patch_lora_unmerge, round_robin, _ForwardRedirection
     from .vllm_client import VLLMClient
+    from .async_rollout import AsyncRolloutRunner, create_async_rollout_runner
+    from .async_manager import AsyncTrainingManager, create_async_manager
 else:
     _import_structure = {
         'cpo_trainer': ['CPOTrainer'],
@@ -28,6 +30,8 @@ else:
         'rlhf_mixin': ['RLHFTrainerMixin'],
         'utils': ['patch_lora_merge', 'patch_lora_unmerge', 'round_robin', '_ForwardRedirection'],
         'vllm_client': ['VLLMClient'],
+        'async_rollout': ['AsyncRolloutRunner', 'create_async_rollout_runner'],
+        'async_manager': ['AsyncTrainingManager', 'create_async_manager'],
     }
 
     import sys

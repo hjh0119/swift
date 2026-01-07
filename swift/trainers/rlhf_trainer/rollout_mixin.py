@@ -47,18 +47,118 @@ logger = get_logger()
 class DataCache:
     """Cache container for rollout results"""
     results: DataType
+    policy_version: int = 0  # Policy version when this rollout was generated
 
 
 class AsyncGenerateCallback(TrainerCallback):
-    """Callback for async generation in training"""
+    """Callback for async generation in training.
+
+    This callback manages async generation with two modes:
+    1. Server mode (vllm_mode='server'): Async logic runs on rollout server side
+       - Uses rollout server's push_inputs/get_samples APIs
+       - Policy version managed by rollout server (auto-incremented on weight update)
+       - Staleness filtering done on rollout server
+    2. Colocate mode (vllm_mode='colocate'): Async logic runs on trainer side
+       - Uses trainer's local queue and prefetch mechanism
+       - Only supports max_staleness=1 (standard async)
+
+    This design allows:
+    1. Clean separation between trainer and rollout concerns
+    2. Same async logic works for different trainers (transformers, megatron)
+    3. Rollout server independently manages async queue and staleness
+    """
 
     def __init__(self, trainer):
         self.trainer = trainer
+        self._last_global_step = 0
+        self._use_server_async = False
 
     def on_train_begin(self, args, state, control, **kwargs):
         self.trainer.queue = self.trainer.train_queue
         train_dataloader = getattr(state, 'train_dataloader', None) or kwargs.get('train_dataloader')
-        self.trainer._prefetch(train_dataloader)
+
+        max_staleness = getattr(self.trainer, 'max_staleness', 1)
+        vllm_mode = getattr(self.trainer, 'vllm_mode', None)
+
+        # Determine if we should use server-side async
+        self._use_server_async = (
+            vllm_mode == 'server' and max_staleness is not None and max_staleness > 1
+            and hasattr(self.trainer, 'vllm_client') and self.trainer.vllm_client is not None)
+
+        if self._use_server_async:
+            # Server mode with fully async: start async generate on rollout server
+            try:
+                result = self.trainer.vllm_client.start_async_generate(max_staleness=max_staleness, )
+                logger.info(f'Started async generate on rollout server: {result}')
+            except Exception as e:
+                logger.warning(f'Failed to start async generate on server, falling back to trainer-side: {e}')
+                self._use_server_async = False
+                self.trainer._prefetch(train_dataloader)
+        elif max_staleness is not None and max_staleness > 1:
+            # Colocate mode with fully async: use trainer-side producer thread
+            self.trainer._start_async_producer(train_dataloader)
+        else:
+            # Standard async (max_staleness=1): single prefetch
+            self.trainer._prefetch(train_dataloader)
+
+    def on_step_end(self, args, state, control, **kwargs):
+        """Handle policy version tracking after each optimizer step.
+
+        In server mode, policy version is managed by rollout server automatically.
+        In colocate mode, we increment it on trainer side.
+        """
+        if self._use_server_async:
+            # Server mode: version is auto-incremented on weight update
+            return
+
+        max_staleness = getattr(self.trainer, 'max_staleness', None)
+        if max_staleness is None:
+            return
+
+        # Colocate mode: increment version after optimizer step
+        if state.global_step > self._last_global_step:
+            self.trainer.increment_policy_version()
+            self._last_global_step = state.global_step
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        """Add staleness metrics to training logs."""
+        max_staleness = getattr(self.trainer, 'max_staleness', None)
+        if max_staleness is None or logs is None:
+            return
+
+        if not self.trainer.model.training:
+            return
+
+        if self._use_server_async:
+            # Server mode: get stats from rollout server
+            try:
+                stats = self.trainer.vllm_client.get_async_stats()
+                logs['async/policy_version'] = stats.get('policy_version', 0)
+                logs['async/stale_dropped'] = stats.get('stale_dropped', 0)
+                logs['async/sample_queue_size'] = stats.get('sample_queue_size', 0)
+            except Exception as e:
+                logger.warning(f'Failed to get async stats from server: {e}')
+        else:
+            # Colocate mode: get stats from trainer
+            staleness_metrics = self.trainer.get_staleness_metrics()
+            logs['async/policy_version'] = staleness_metrics['policy_version']
+            logs['async/stale_samples_dropped'] = staleness_metrics['stale_samples_dropped']
+            logs['async/staleness_drop_rate'] = staleness_metrics['staleness_drop_rate']
+
+    def on_train_end(self, args, state, control, **kwargs):
+        """Stop async generation."""
+        if self._use_server_async:
+            # Server mode: stop async generate on rollout server
+            try:
+                result = self.trainer.vllm_client.stop_async_generate()
+                logger.info(f'Stopped async generate on rollout server: {result}')
+            except Exception as e:
+                logger.warning(f'Failed to stop async generate on server: {e}')
+        else:
+            # Colocate mode: stop trainer-side producer
+            max_staleness = getattr(self.trainer, 'max_staleness', 1)
+            if max_staleness is not None and max_staleness > 1:
+                self.trainer._stop_async_producer()
 
 
 class RolloutTrainerMixin(RLHFTrainerMixin):
@@ -928,10 +1028,49 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
 
             if hasattr(self, 'async_generate') and self.async_generate:
                 all_inputs = gather_object(inputs)
-                self.async_generate_rollout(all_inputs)
 
-                data_cache = self._queue.get()
-                all_outputs = gather_object(data_cache.results)
+                # Check if we're using server-side async (fully async with server mode)
+                use_server_async = (
+                    self.vllm_mode == 'server' and self.max_staleness is not None and self.max_staleness > 1
+                    and hasattr(self, 'vllm_client') and self.vllm_client is not None)
+
+                if use_server_async:
+                    # Server mode fully async: push inputs and get samples from rollout server
+                    try:
+                        # Push current inputs for next batch generation
+                        self.vllm_client.push_inputs(all_inputs, self.request_config)
+
+                        # Get samples from server (staleness filtering done on server side)
+                        result = self.vllm_client.get_samples(
+                            timeout=120.0,
+                            max_staleness=self.max_staleness,
+                        )
+                        if not result.get('success'):
+                            # Fallback to synchronous generation
+                            logger.warning('Falling back to synchronous generation: ' + result.get('message', ''))
+                            with self.multi_turn_completion_length_context():
+                                outputs = self._infer_single_or_multi_turn(inputs, self.request_config)
+                            return outputs
+                        all_outputs = gather_object(result.get('samples', []))
+                    except Exception as e:
+                        logger.warning(f'Server async failed, falling back to sync: {e}')
+                        with self.multi_turn_completion_length_context():
+                            outputs = self._infer_single_or_multi_turn(inputs, self.request_config)
+                        return outputs
+                elif self.max_staleness is not None and self.max_staleness > 1:
+                    # Colocate mode fully async: get fresh samples from local queue
+                    data_cache = self.get_fresh_samples_from_queue(timeout=120.0)
+                    if data_cache is None:
+                        logger.warning('Falling back to synchronous generation due to no fresh samples')
+                        with self.multi_turn_completion_length_context():
+                            outputs = self._infer_single_or_multi_turn(inputs, self.request_config)
+                        return outputs
+                    all_outputs = gather_object(data_cache.results)
+                else:
+                    # Standard async mode (max_staleness=1): single prefetch
+                    self.async_generate_rollout(all_inputs)
+                    data_cache = self._queue.get()
+                    all_outputs = gather_object(data_cache.results)
 
                 per_device_datasize = len(all_outputs) // self.accelerator.num_processes
                 process_slice = slice(
@@ -1371,10 +1510,39 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
         future.add_done_callback(done)
 
     def _prepare_async_generate(self):
-        """Initialize async generation queues and callback"""
+        """Initialize async generation queues and callback.
+
+        Async generation modes controlled by max_staleness:
+        - max_staleness = 1 (default): Standard async with single prefetch, equivalent to original async_generate
+        - max_staleness > 1: Fully async with background producer thread, allows more off-policy samples
+        """
         self.train_queue = Queue()
         self.eval_queue = Queue()
         args = self.args
+
+        # Initialize policy version tracking
+        self._policy_version = 0
+        self._async_producer_running = False
+        self._async_stop_event = None
+        self._async_producer_thread = None
+
+        # Staleness control: default to 1 (equivalent to original async_generate behavior)
+        self.max_staleness = getattr(args, 'max_staleness', None)
+        if args.async_generate and self.max_staleness is None:
+            self.max_staleness = 1
+
+        # Validate configuration for fully async mode (max_staleness > 1)
+        if args.async_generate and self.max_staleness is not None and self.max_staleness > 1:
+            vllm_mode = getattr(args, 'vllm_mode', None)
+            if vllm_mode != 'server':
+                raise ValueError(f'max_staleness > 1 requires vllm_mode="server". '
+                                 f'Current vllm_mode: {vllm_mode}. '
+                                 'Colocate mode does not support fully async generation because '
+                                 'it requires synchronous weight updates.')
+
+        # Staleness tracking metrics
+        self._stale_samples_dropped = 0
+        self._total_samples_consumed = 0
 
         if args.async_generate:
             self.add_callback(AsyncGenerateCallback(self))
@@ -1410,7 +1578,152 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
             self._move_model_to_vllm(skip_async_check=True)
             self._last_loaded_step = self.state.global_step
         results = self._infer_single_or_multi_turn(all_inputs, self.request_config, is_global_inputs=True)
-        self._queue.put(DataCache(results))
+        self._queue.put(DataCache(results, policy_version=self._policy_version))
+
+    def increment_policy_version(self):
+        """Increment policy version after training step.
+
+        Called after each training step to track policy version for staleness control.
+        """
+        self._policy_version += 1
+
+    def get_policy_version(self) -> int:
+        """Get current policy version."""
+        return self._policy_version
+
+    def _filter_stale_samples(self, data_cache: DataCache) -> Optional[DataCache]:
+        """Filter out stale samples based on policy version difference.
+
+        Args:
+            data_cache: DataCache containing rollout results and policy version
+
+        Returns:
+            DataCache if samples are fresh enough, None if all samples are stale
+        """
+        if self.max_staleness is None:
+            return data_cache
+
+        version_diff = self._policy_version - data_cache.policy_version
+        if version_diff > self.max_staleness:
+            self._stale_samples_dropped += len(data_cache.results) if data_cache.results else 0
+            logger.info(f'Dropped stale samples: version_diff={version_diff}, '
+                        f'max_staleness={self.max_staleness}, '
+                        f'total_dropped={self._stale_samples_dropped}')
+            return None
+        return data_cache
+
+    def _start_async_producer(self, dataloader: DataLoader):
+        """Start the async producer thread that continuously generates samples.
+
+        Used when max_staleness > 1 to enable fully async generation with
+        background rollout production.
+
+        Args:
+            dataloader: Training dataloader to fetch inputs from
+        """
+        import threading
+
+        if self._async_producer_running:
+            return
+
+        self._async_stop_event = threading.Event()
+        self._dataloader_iter = iter(dataloader)
+
+        def producer_loop():
+            """Background thread loop that continuously generates rollout samples."""
+            while not self._async_stop_event.is_set():
+                try:
+                    # Get next batch of inputs
+                    try:
+                        inputs = next(self._dataloader_iter)
+                    except StopIteration:
+                        # Restart dataloader iterator
+                        self._dataloader_iter = iter(dataloader)
+                        inputs = next(self._dataloader_iter)
+
+                    if self.template.truncation_strategy == 'raise':
+                        inputs = self.resample_encode_failed_inputs(inputs)
+                    inputs = self._preprocess_inputs(inputs)
+                    all_inputs = gather_object(inputs)
+
+                    # Sync weights to vLLM periodically (but don't wait for training)
+                    current_version = self._policy_version
+                    if self._last_loaded_step != current_version:
+                        self._move_model_to_vllm(skip_async_check=True)
+                        self._last_loaded_step = current_version
+
+                    # Generate rollout
+                    results = self._infer_single_or_multi_turn(all_inputs, self.request_config, is_global_inputs=True)
+
+                    # Put results in queue with version info
+                    self._queue.put(DataCache(results, policy_version=current_version))
+
+                except Exception as e:
+                    logger.error(f'Error in async producer: {e}')
+                    if self._async_stop_event.is_set():
+                        break
+                    time.sleep(0.1)  # Brief pause before retry
+
+        self._async_producer_thread = threading.Thread(target=producer_loop, daemon=True, name='AsyncProducer')
+        self._async_producer_running = True
+        self._async_producer_thread.start()
+        logger.info(f'Started async producer thread (max_staleness={self.max_staleness})')
+
+    def _stop_async_producer(self):
+        """Stop the async producer thread."""
+        if self._async_stop_event is not None:
+            self._async_stop_event.set()
+        if self._async_producer_thread is not None:
+            self._async_producer_thread.join(timeout=5.0)
+            if self._async_producer_thread.is_alive():
+                logger.warning('Async producer thread did not stop gracefully')
+        self._async_producer_running = False
+        logger.info('Stopped async producer thread')
+
+    def get_fresh_samples_from_queue(self, timeout: float = 60.0) -> Optional[DataCache]:
+        """Get fresh samples from queue, filtering out stale ones.
+
+        This method will keep polling the queue until fresh samples are found
+        or timeout is reached.
+
+        Args:
+            timeout: Maximum time to wait for fresh samples in seconds
+
+        Returns:
+            DataCache with fresh samples, or None if timeout reached
+        """
+        import queue as queue_module
+
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            try:
+                data_cache = self._queue.get(timeout=1.0)
+                filtered = self._filter_stale_samples(data_cache)
+                if filtered is not None:
+                    self._total_samples_consumed += len(filtered.results) if filtered.results else 0
+                    return filtered
+                # Samples were stale, try again
+            except queue_module.Empty:
+                continue
+        logger.warning(f'Timeout waiting for fresh samples after {timeout}s')
+        return None
+
+    def get_staleness_metrics(self) -> Dict[str, Any]:
+        """Get staleness tracking metrics.
+
+        Returns:
+            Dictionary containing staleness metrics
+        """
+        return {
+            'policy_version':
+            self._policy_version,
+            'stale_samples_dropped':
+            self._stale_samples_dropped,
+            'total_samples_consumed':
+            self._total_samples_consumed,
+            'staleness_drop_rate':
+            (self._stale_samples_dropped / max(1, self._stale_samples_dropped + self._total_samples_consumed)),
+        }
 
     @contextmanager
     def _disable_sp_context(self, template: Optional[Template] = None):

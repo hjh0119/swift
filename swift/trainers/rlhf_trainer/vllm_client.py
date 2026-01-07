@@ -444,3 +444,144 @@ class VLLMClient:
                     logger.warning(f'Server {i} close failed: {response.text}')
             except Exception as e:
                 logger.warning(f'Error closing server {i} communicator: {str(e)}')
+
+    # ==================== Async Generate APIs ====================
+
+    def push_inputs(
+        self,
+        infer_requests: List[Union[dict, RolloutInferRequest]],
+        request_config: Optional[RequestConfig] = None,
+    ) -> dict:
+        """Push inputs to the rollout server's async input queue.
+
+        Args:
+            infer_requests: List of inference requests
+            request_config: Optional request configuration
+
+        Returns:
+            Dict with success status and queue info
+        """
+        # Serialize requests
+        requests_data = []
+        for req in infer_requests:
+            if isinstance(req, dict):
+                requests_data.append(req)
+            elif hasattr(req, '__dataclass_fields__'):
+                requests_data.append(asdict(req))
+            else:
+                requests_data.append(req)
+
+        config_data = None
+        if request_config is not None:
+            if hasattr(request_config, '__dataclass_fields__'):
+                config_data = asdict(request_config)
+            elif isinstance(request_config, dict):
+                config_data = request_config
+            else:
+                config_data = request_config.model_dump() if hasattr(request_config, 'model_dump') else None
+
+        # Send to first server (all servers share the same queue in current design)
+        data = {
+            'infer_requests': requests_data,
+            'request_config': config_data,
+        }
+        response = self.sessions[0].post(f'{self.base_urls[0]}/push_inputs/', json=data)
+        if response.status_code != 200:
+            raise Exception(f'Push inputs failed: {response.text}')
+
+        return response.json()
+
+    def get_samples(self, timeout: float = 60.0, max_staleness: Optional[int] = None) -> dict:
+        """Get fresh samples from the rollout server's async sample queue.
+
+        Args:
+            timeout: Maximum time to wait for samples
+            max_staleness: Override max staleness (uses server default if None)
+
+        Returns:
+            Dict with samples and metadata
+        """
+        data = {
+            'timeout': timeout,
+            'max_staleness': max_staleness,
+        }
+        response = self.sessions[0].post(f'{self.base_urls[0]}/get_samples/', json=data)
+        if response.status_code != 200:
+            raise Exception(f'Get samples failed: {response.text}')
+
+        return response.json()
+
+    def get_async_stats(self) -> dict:
+        """Get async generation statistics from the rollout server.
+
+        Returns:
+            Dict with queue statistics and version info
+        """
+        response = self.sessions[0].get(f'{self.base_urls[0]}/get_async_stats/')
+        if response.status_code != 200:
+            raise Exception(f'Get async stats failed: {response.text}')
+
+        return response.json()
+
+    def start_async_generate(
+        self,
+        max_queue_size: Optional[int] = None,
+        max_staleness: Optional[int] = None,
+    ) -> dict:
+        """Start the async generation background worker on the rollout server.
+
+        Args:
+            max_queue_size: Override max queue size
+            max_staleness: Override max staleness
+
+        Returns:
+            Dict with status
+        """
+        data = {
+            'max_queue_size': max_queue_size,
+            'max_staleness': max_staleness,
+        }
+        response = self.sessions[0].post(f'{self.base_urls[0]}/start_async_generate/', json=data)
+        if response.status_code != 200:
+            raise Exception(f'Start async generate failed: {response.text}')
+
+        return response.json()
+
+    def stop_async_generate(self) -> dict:
+        """Stop the async generation background worker on the rollout server.
+
+        Returns:
+            Dict with status
+        """
+        response = self.sessions[0].post(f'{self.base_urls[0]}/stop_async_generate/')
+        if response.status_code != 200:
+            raise Exception(f'Stop async generate failed: {response.text}')
+
+        return response.json()
+
+    def pause_async_generate(self) -> dict:
+        """Pause async generation for weight updates.
+
+        This pauses new generation while allowing in-flight requests to complete.
+        Should be called before weight updates to avoid generating stale samples.
+
+        Returns:
+            Dict with status and policy version
+        """
+        response = self.sessions[0].post(f'{self.base_urls[0]}/pause_async_generate/')
+        if response.status_code != 200:
+            raise Exception(f'Pause async generate failed: {response.text}')
+
+        return response.json()
+
+    def resume_async_generate(self) -> dict:
+        """Resume async generation after weight update.
+
+        Returns:
+            Dict with status and policy version
+        """
+        response = self.sessions[0].post(f'{self.base_urls[0]}/resume_async_generate/')
+        if response.status_code != 200:
+            raise Exception(f'Resume async generate failed: {response.text}')
+
+        return response.json()

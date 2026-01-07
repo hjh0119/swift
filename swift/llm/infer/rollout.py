@@ -19,16 +19,18 @@ import asyncio
 import inspect
 import multiprocessing
 import os
+import threading
 import time
 import traceback
+from collections import deque
 from collections.abc import Sequence
 from contextlib import asynccontextmanager, contextmanager
-from dataclasses import asdict
+from dataclasses import asdict, dataclass, field
 from functools import wraps
 from itertools import chain
 from multiprocessing import Pipe, Process
 from multiprocessing.connection import Connection
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import torch
 import uvicorn
@@ -39,6 +41,7 @@ from trl.scripts.vllm_serve import WeightSyncWorkerExtension as HFWeightSyncWork
 from swift.llm import RolloutArguments, SwiftPipeline
 from swift.llm.template.template_inputs import RolloutInferRequest
 from swift.plugin.multi_turn import RolloutScheduler, multi_turns
+from swift.trainers.rlhf_trainer.async_rollout import AsyncRolloutRunner
 from swift.trainers.rlhf_trainer.utils import (FlattenedTensorBucket, FlattenedTensorMetadata, TensorLoRARequest,
                                                UpdateAdapterRequest, UpdateFlattenedAdapterRequest,
                                                UpdateFlattenedParamsRequest, check_vllm_version_ge,
@@ -71,6 +74,20 @@ Note:
 """
 
 patch_vllm_load_adapter()
+
+
+@dataclass
+class PushInputsRequest:
+    """Request for pushing inputs to the async queue."""
+    infer_requests: List[Dict]
+    request_config: Optional[Dict] = None
+
+
+@dataclass
+class GetSamplesRequest:
+    """Request for getting samples from the async queue."""
+    timeout: float = 60.0
+    max_staleness: Optional[int] = None
 
 
 class WeightSyncWorkerExtension(HFWeightSyncWorkerExtension):
@@ -260,11 +277,14 @@ def llm_worker(args: RolloutArguments, data_parallel_rank: int, master_port: int
             method = getattr(rollout_engine, method_name, None) or getattr(rollout_engine.engine, method_name, None)
             try:
                 result = method(*args, **kwargs)
-            except Exception:
-                logger.error(f'Method execution failed: {method_name}\n{traceback.format_exc()}')
-                result = None
-            if command['type'] == 'call':
-                connection.send(result)
+                if command['type'] == 'call':
+                    connection.send(result)
+            except Exception as e:
+                error_msg = f'Method execution failed: {method_name}\n{traceback.format_exc()}'
+                logger.error(error_msg)
+                if command['type'] == 'call':
+                    # Send error info back to parent for fail-fast
+                    connection.send({'__error__': True, 'message': str(e), 'traceback': error_msg})
         elif command['type'] == 'shutdown':
             break
 
@@ -296,12 +316,14 @@ async def async_llm_worker(args: RolloutArguments, data_parallel_rank: int, mast
             method = getattr(rollout_engine, method_name, None) or getattr(rollout_engine.engine, method_name, None)
             try:
                 result = await method(*args, **kwargs)
-            except Exception:
-                logger.error(f'Method execution failed: {method_name}\n{traceback.format_exc()}')
-                result = None
-
-            if command['type'] == 'call':
-                connection.send(result)
+                if command['type'] == 'call':
+                    connection.send(result)
+            except Exception as e:
+                error_msg = f'Method execution failed: {method_name}\n{traceback.format_exc()}'
+                logger.error(error_msg)
+                if command['type'] == 'call':
+                    # Send error info back to parent for fail-fast
+                    connection.send({'__error__': True, 'message': str(e), 'traceback': error_msg})
         elif command['type'] == 'shutdown':
             break
 
@@ -326,6 +348,15 @@ class SwiftRolloutDeploy(SwiftPipeline):
         self.app.post('/close_communicator/')(self.close_communicator)
         self.app.post('/infer/', response_model=None)(self.infer)
         self.app.post('/get_engine_type/')(self.get_engine_type)
+        # Async generate APIs
+        self.app.post('/push_inputs/')(self.push_inputs)
+        self.app.post('/get_samples/')(self.get_samples)
+        self.app.get('/get_async_stats/')(self.get_async_stats)
+        self.app.post('/start_async_generate/')(self.start_async_generate)
+        self.app.post('/stop_async_generate/')(self.stop_async_generate)
+        # Pause/resume for weight updates (new in optimized version)
+        self.app.post('/pause_async_generate/')(self.pause_async_generate)
+        self.app.post('/resume_async_generate/')(self.resume_async_generate)
 
     def __init__(self, args: Optional[Union[List[str], RolloutArguments]] = None):
         super().__init__(args)
@@ -339,6 +370,20 @@ class SwiftRolloutDeploy(SwiftPipeline):
         self.connections = []
         self.processes = []
         self._start_data_parallel_workers()
+
+        # Async generate infrastructure (using unified AsyncRolloutRunner)
+        max_queue_size = getattr(self.args, 'async_queue_size', 100)
+        max_staleness = getattr(self.args, 'max_staleness', 2)
+        max_concurrent_rollouts = getattr(self.args, 'max_concurrent_rollouts', None)
+        consumer_batch_size = getattr(self.args, 'rollout_batch_size', 1)
+        self._async_runner: Optional[AsyncRolloutRunner] = None
+        self._async_runner_config = {
+            'max_queue_size': max_queue_size,
+            'max_staleness': max_staleness,
+            'max_concurrent': max_concurrent_rollouts,
+            'consumer_batch_size': consumer_batch_size,
+        }
+        self._async_generate_running = False
 
     def _start_data_parallel_workers(self):
         for data_parallel_rank in range(self.num_connections):
@@ -475,7 +520,10 @@ class SwiftRolloutDeploy(SwiftPipeline):
         for connection in self.connections:
             connection.send({'type': 'fire_and_forget', 'method': 'collective_rpc', 'kwargs': kwargs})
 
-        return {'message': 'Request received, updating named parameter'}
+        # Auto-increment policy version after weight update for async generate
+        new_version = self._async_runner.increment_version() if self._async_runner else 0
+
+        return {'message': 'Request received, updating named parameter', 'policy_version': new_version}
 
     async def update_adapter_flattened_param(self, request: UpdateFlattenedAdapterRequest):
         peft_config = asdict(request.peft_config)
@@ -487,7 +535,10 @@ class SwiftRolloutDeploy(SwiftPipeline):
         for connection in self.connections:
             connection.send({'type': 'fire_and_forget', 'method': 'collective_rpc', 'kwargs': kwargs})
 
-        return {'message': 'Request received, updating adapter parameter'}
+        # Auto-increment policy version after weight update for async generate
+        new_version = self._async_runner.increment_version() if self._async_runner else 0
+
+        return {'message': 'Request received, updating adapter parameter', 'policy_version': new_version}
 
     async def update_adapter_param(self, request: UpdateAdapterRequest):
         """
@@ -509,7 +560,13 @@ class SwiftRolloutDeploy(SwiftPipeline):
         for connection in self.connections:
             connection.send({'type': 'fire_and_forget', 'method': 'collective_rpc', 'kwargs': kwargs})
 
-        return {'message': 'Request received, updating adapter parameter (non-flattened)'}
+        # Auto-increment policy version after weight update for async generate
+        new_version = self._async_runner.increment_version() if self._async_runner else 0
+
+        return {
+            'message': 'Request received, updating adapter parameter (non-flattened)',
+            'policy_version': new_version
+        }
 
     async def update_flattened_params(self, request: UpdateFlattenedParamsRequest):
         """
@@ -528,7 +585,10 @@ class SwiftRolloutDeploy(SwiftPipeline):
         for connection in self.connections:
             connection.send({'type': 'fire_and_forget', 'method': 'collective_rpc', 'kwargs': kwargs})
 
-        return {'message': 'Request received, updating flattened parameters'}
+        # Auto-increment policy version after weight update for async generate
+        new_version = self._async_runner.increment_version() if self._async_runner else 0
+
+        return {'message': 'Request received, updating flattened parameters', 'policy_version': new_version}
 
     async def reset_prefix_cache(self):
         """
@@ -537,7 +597,15 @@ class SwiftRolloutDeploy(SwiftPipeline):
         for connection in self.connections:
             connection.send({'type': 'call', 'method': 'reset_prefix_cache'})
         # Wait for and collect all results
-        all_outputs = [connection.recv() for connection in self.connections]
+        all_outputs = []
+        for connection in self.connections:
+            output = connection.recv()
+            # Check for error from worker
+            if isinstance(output, dict) and output.get('__error__'):
+                logger.warning(f'reset_prefix_cache worker error: {output.get("message")}')
+                all_outputs.append(False)
+            else:
+                all_outputs.append(output)
         success = all(output for output in all_outputs)
         return {'message': 'Request received, resetting prefix cache status: ' + str(success)}
 
@@ -605,11 +673,251 @@ class SwiftRolloutDeploy(SwiftPipeline):
             method = 'infer' if not self.use_async_engine else 'async_infer'
             connection.send({'type': 'call', 'method': method, 'kwargs': kwargs})
 
-        all_outputs = [connection.recv() for connection in self.connections]
-        # Handle empty prompts (see above)
-        all_outputs = [output for output, requests in zip(all_outputs, chunked_infer_requests) if requests]
-        all_outputs = list(chain.from_iterable(all_outputs))  # from list of list to single list
+        all_outputs = []
+        for connection, requests in zip(self.connections, chunked_infer_requests):
+            output = connection.recv()
+            # Check for error from worker (fail-fast)
+            if isinstance(output, dict) and output.get('__error__'):
+                error_msg = output.get('message', 'Unknown error')
+                traceback_msg = output.get('traceback', '')
+                logger.error(f'Worker error:\n{traceback_msg}')
+                raise RuntimeError(f'Rollout worker failed: {error_msg}')
+            if requests:  # Handle empty prompts (see above)
+                all_outputs.append(output)
 
+        all_outputs = list(chain.from_iterable(all_outputs))  # from list of list to single list
+        return all_outputs
+
+    # ==================== Async Generate APIs ====================
+
+    async def push_inputs(
+        self,
+        infer_requests: List[Union[Dict, RolloutInferRequest]],
+        request_config: Optional[RequestConfig] = None,
+    ):
+        """Push inputs to the async input queue for background generation.
+
+        Args:
+            infer_requests: List of inference requests to process
+            request_config: Optional request configuration
+
+        Returns:
+            Dict with success status and queue statistics
+        """
+        # Convert to serializable format
+        requests_data = []
+        for req in infer_requests:
+            if isinstance(req, dict):
+                requests_data.append(req)
+            else:
+                requests_data.append(asdict(req) if hasattr(req, '__dataclass_fields__') else req)
+
+        config_data = None
+        if request_config is not None:
+            config_data = asdict(request_config) if hasattr(request_config, '__dataclass_fields__') else request_config
+
+        if self._async_runner is None:
+            return {'success': False, 'message': 'Async runner not initialized'}
+
+        try:
+            self._async_runner.submit(requests_data, config=config_data)
+            stats = self._async_runner.get_stats()
+            return {
+                'success': True,
+                'input_queue_size': stats['input_queue_size'],
+                'policy_version': stats['policy_version'],
+            }
+        except Exception as e:
+            return {'success': False, 'message': str(e)}
+
+    async def get_samples(
+        self,
+        timeout: float = 60.0,
+        max_staleness: Optional[int] = None,
+    ):
+        """Get fresh samples from the async sample queue with staleness filtering.
+
+        Args:
+            timeout: Maximum time to wait for samples
+            max_staleness: Override max_staleness (uses default if None)
+
+        Returns:
+            Dict with samples and metadata, or None if timeout
+        """
+        if self._async_runner is None:
+            return {'success': False, 'samples': None, 'message': 'Async runner not initialized'}
+
+        # Run in executor to avoid blocking the event loop
+        loop = asyncio.get_event_loop()
+        try:
+            results = await loop.run_in_executor(
+                None, lambda: self._async_runner.wait(count=1, timeout=timeout, with_timing=True))
+            if results:
+                r = results[0]
+                return {
+                    'success': True,
+                    'samples': r.data,
+                    'policy_version': r.policy_version,
+                    'timestamp': r.create_time / 1e9,
+                }
+            return {
+                'success': False,
+                'samples': None,
+                'policy_version': None,
+                'message': 'No samples available',
+            }
+        except Exception as e:
+            return {
+                'success': False,
+                'samples': None,
+                'policy_version': None,
+                'message': f'Error: {e}',
+            }
+
+    async def get_async_stats(self):
+        """Get async generation statistics.
+
+        Returns:
+            Dict with queue statistics and version info
+        """
+        if self._async_runner is None:
+            return {'async_generate_running': False, 'message': 'Not initialized'}
+        stats = self._async_runner.get_stats()
+        stats['async_generate_running'] = self._async_generate_running
+        return stats
+
+    async def start_async_generate(
+        self,
+        max_queue_size: Optional[int] = None,
+        max_staleness: Optional[int] = None,
+    ):
+        """Start the async generation background worker.
+
+        Args:
+            max_queue_size: Override max queue size
+            max_staleness: Override max staleness
+
+        Returns:
+            Dict with status
+        """
+        if self._async_generate_running:
+            return {'success': False, 'message': 'Async generate already running'}
+
+        # Update config if provided
+        config = self._async_runner_config.copy()
+        if max_queue_size is not None:
+            config['max_queue_size'] = max_queue_size
+        if max_staleness is not None:
+            config['max_staleness'] = max_staleness
+
+        # Create and initialize the unified AsyncRolloutRunner
+        self._async_runner = AsyncRolloutRunner(**config)
+        self._async_runner.initialize(generate_fn=self._generate_samples_sync)
+        self._async_generate_running = True
+
+        logger.info(f'Started async generate runner (max_staleness={config["max_staleness"]}, '
+                    f'capacity={self._async_runner.get_capacity()})')
+        return {'success': True, 'message': 'Async generate started'}
+
+    async def stop_async_generate(self):
+        """Stop the async generation background worker.
+
+        Returns:
+            Dict with status
+        """
+        if not self._async_generate_running:
+            return {'success': False, 'message': 'Async generate not running'}
+
+        if self._async_runner is not None:
+            self._async_runner.destroy(timeout=5.0)
+            self._async_runner = None
+
+        self._async_generate_running = False
+        logger.info('Stopped async generate runner')
+        return {'success': True, 'message': 'Async generate stopped'}
+
+    async def pause_async_generate(self):
+        """Pause async generation (for weight updates).
+
+        This pauses new generation while allowing in-flight requests to complete.
+        Should be called before weight updates to avoid generating stale samples.
+
+        Returns:
+            Dict with status
+        """
+        if not self._async_generate_running or self._async_runner is None:
+            return {'success': False, 'message': 'Async generate not running'}
+
+        self._async_runner.pause()
+        logger.info('Paused async generate for weight update')
+        return {
+            'success': True,
+            'message': 'Async generate paused',
+            'policy_version': self._async_runner.get_version(),
+        }
+
+    async def resume_async_generate(self):
+        """Resume async generation after weight update.
+
+        Returns:
+            Dict with status
+        """
+        if not self._async_generate_running or self._async_runner is None:
+            return {'success': False, 'message': 'Async generate not running'}
+
+        self._async_runner.resume()
+        logger.info('Resumed async generate after weight update')
+        return {
+            'success': True,
+            'message': 'Async generate resumed',
+            'policy_version': self._async_runner.get_version(),
+        }
+
+    def _generate_samples_sync(self, infer_requests: List[Dict], request_config_data: Optional[Dict]) -> List:
+        """Synchronously generate samples using the rollout engine.
+
+        This method is called by AsyncRolloutRunner's background thread.
+
+        Args:
+            infer_requests: List of inference requests
+            request_config_data: Optional request configuration dict
+
+        Returns:
+            List of generated outputs
+
+        Raises:
+            RuntimeError: If any worker fails (fail-fast)
+        """
+        # Reconstruct request_config
+        request_config = None
+        if request_config_data is not None:
+            request_config = RequestConfig(**request_config_data)
+
+        # Generate samples synchronously
+        chunked_infer_requests = chunk_list(infer_requests, self.num_connections)
+
+        for i, (connection, requests) in enumerate(zip(self.connections, chunked_infer_requests)):
+            if not requests:
+                requests = [{'messages': [{'role': 'user', 'content': '<placeholder>'}]}]
+            if request_config and request_config.seed:
+                request_config.seed += i * len(requests)
+            kwargs = {'infer_requests': requests, 'request_config': request_config, 'use_tqdm': False}
+            method = 'infer' if not self.use_async_engine else 'async_infer'
+            connection.send({'type': 'call', 'method': method, 'kwargs': kwargs})
+
+        all_outputs = []
+        for connection, requests in zip(self.connections, chunked_infer_requests):
+            output = connection.recv()
+            # Check for error from worker (fail-fast)
+            if isinstance(output, dict) and output.get('__error__'):
+                error_msg = output.get('message', 'Unknown error')
+                traceback_msg = output.get('traceback', '')
+                logger.error(f'Worker error:\n{traceback_msg}')
+                raise RuntimeError(f'Rollout worker failed: {error_msg}')
+            if requests:  # Only include non-placeholder results
+                all_outputs.append(output)
+
+        all_outputs = list(chain.from_iterable(all_outputs))
         return all_outputs
 
     def run(self):
