@@ -1,36 +1,26 @@
-"""
-Async Rollout Infrastructure for Fully Asynchronous Policy Training.
+"""Unified high-performance async rollout runner for RL training.
 
-This module provides a simplified, high-performance async rollout implementation
-combining best practices from:
-- AReaL: uvloop-based runner, clean lifecycle, shutdown hooks
-- verl: staleness_threshold proportion control
-- slime: simplicity and minimal overhead
+This module provides an optimized asynchronous task execution framework
+for rollout generation in reinforcement learning training pipelines.
 
-Design principles:
-1. Single unified AsyncRolloutRunner class
-2. Integrated staleness management for capacity control
-3. Minimal public API: submit/wait/pause/resume/destroy
-4. Thread-safe with proper synchronization
+Key features:
+1. Single asyncio event loop in background thread (uvloop for performance)
+2. Integrated staleness management via StalenessManager
+3. Thread-safe submit/wait/pause/resume/destroy APIs
+4. Condition-based notification for efficient waiting (no polling)
+5. Fail-fast error propagation for generation/reward errors
+6. Producer-consumer separation for high throughput
 
-Usage:
-    runner = AsyncRolloutRunner(max_queue_size=100, max_staleness=2)
-    runner.initialize(generate_fn=my_generate)
+Architecture:
+    Main Thread                    Background Thread (asyncio loop)
+    ┌──────────────┐               ┌─────────────────────────────────┐
+    │   submit()   │──InputQueue──▶│   _submit_pending_tasks()       │
+    │              │               │         ↓                       │
+    │   wait()     │◀─OutputQueue─│   _process_results()            │
+    └──────────────┘               └─────────────────────────────────┘
+         ▲                                      │
+         └──────── Condition notify ────────────┘
 
-    # Submit work
-    runner.submit(requests)
-
-    # Get results
-    results = runner.wait(count=32)
-
-    # Weight update
-    runner.pause()
-    update_weights()
-    runner.resume()
-    runner.increment_version()
-
-    # Cleanup
-    runner.destroy()
 """
 
 from __future__ import annotations
@@ -83,7 +73,14 @@ class RolloutShutdownError(AsyncRolloutError):
 
 @dataclass
 class RolloutStats:
-    """Statistics for rollout generation tracking."""
+    """Statistics for rollout generation tracking.
+
+    State machine:
+        submit() → running++
+        result accepted → running--, accepted++
+        result rejected → running--, rejected++
+        wait() consumes → accepted--
+    """
     running: int = 0
     accepted: int = 0
     rejected: int = 0
@@ -135,10 +132,11 @@ class AsyncRolloutRunner(Generic[T]):
     1. Single asyncio event loop in a background thread (uvloop for performance)
     2. Integrated staleness management with capacity control
     3. Thread-safe submit/wait/pause/resume/destroy APIs
-    4. Shutdown hooks and health monitoring
-    5. Fail-fast error propagation for generation/reward errors
+    4. Condition-based notification for efficient waiting
+    5. Shutdown hooks and health monitoring
+    6. Fail-fast error propagation for generation/reward errors
 
-    Staleness Control Formula (from verl):
+    Staleness Control Formula:
         max_samples = (max_staleness + current_version + 1) * consumer_batch_size
         staleness_capacity = max_samples - (accepted + running)
         capacity = min(concurrency_capacity, staleness_capacity)
@@ -188,16 +186,15 @@ class AsyncRolloutRunner(Generic[T]):
         self._version = 0
         self._version_lock = threading.Lock()
 
-        # High-performance queues using deque + asyncio.Condition (verl pattern)
         # Input queue: thread-safe with threading.Condition
         self._input_queue: Deque[_TaskInput] = deque(maxlen=max_queue_size)
         self._input_lock = threading.Lock()
-        self._input_not_empty = threading.Condition(self._input_lock)
+        self._input_cv = threading.Condition(self._input_lock)
 
-        # Output queue: async-safe with asyncio.Condition (for efficient waiting)
+        # Output queue: thread-safe with threading.Condition for efficient waiting
         self._output_queue: Deque[TimedResult[T]] = deque(maxlen=max_queue_size)
-        self._output_lock: Optional[asyncio.Lock] = None
-        self._output_condition: Optional[asyncio.Condition] = None
+        self._output_lock = threading.Lock()
+        self._output_cv = threading.Condition(self._output_lock)
 
         # Thread control
         self._exiting = threading.Event()
@@ -272,6 +269,10 @@ class AsyncRolloutRunner(Generic[T]):
             self._paused.clear()
             self._signal_new_input()
 
+            # Wake up any threads waiting on output
+            with self._output_cv:
+                self._output_cv.notify_all()
+
         if self._thread is not None:
             self._thread.join(timeout=timeout)
             if self._thread.is_alive():
@@ -298,7 +299,7 @@ class AsyncRolloutRunner(Generic[T]):
             # Concurrency-based capacity
             concurrency_cap = self.max_concurrent - self._stats.running
 
-            # Staleness-based capacity (verl formula)
+            # Staleness-based capacity
             max_samples = (self.max_staleness + version + 1) * self.consumer_batch_size
             staleness_cap = max_samples - (self._stats.accepted + self._stats.running)
 
@@ -326,6 +327,10 @@ class AsyncRolloutRunner(Generic[T]):
 
         Returns:
             Task ID for tracking
+
+        Raises:
+            QueueFullError: If the input queue is full
+            RolloutShutdownError: If the runner is shutting down
         """
         self._check_health()
 
@@ -344,12 +349,12 @@ class AsyncRolloutRunner(Generic[T]):
             task_id=task_id,
         )
 
-        with self._input_lock:
+        with self._input_cv:
             if len(self._input_queue) >= self.max_queue_size:
                 raise QueueFullError(f'Input queue full (size={self.max_queue_size}). '
                                      'Increase max_queue_size or wait for tasks to complete.')
             self._input_queue.append(task_input)
-            self._input_not_empty.notify()
+            self._input_cv.notify()
 
         self._signal_new_input()
         return task_id
@@ -364,6 +369,8 @@ class AsyncRolloutRunner(Generic[T]):
     ) -> List[T] | List[TimedResult[T]]:
         """Wait for specified number of results.
 
+        Uses Condition-based notification for efficient waiting (no polling).
+
         Args:
             count: Number of results to wait for
             timeout: Maximum wait time (None = wait indefinitely)
@@ -371,6 +378,10 @@ class AsyncRolloutRunner(Generic[T]):
 
         Returns:
             List of results (or TimedResult if with_timing=True)
+
+        Raises:
+            RolloutTimeoutError: If timeout expires before getting enough results
+            RolloutShutdownError: If the runner is shutting down
         """
         if timeout is None:
             timeout = float(7 * 24 * 3600)  # 7 days
@@ -388,10 +399,18 @@ class AsyncRolloutRunner(Generic[T]):
             if remaining <= 0:
                 raise RolloutTimeoutError(f'Timeout waiting for {count} results, got {len(results)}')
 
-            # Use event-driven wait via asyncio from background thread
-            result = self._wait_output_one(min(self.poll_sleep_time, remaining))
-            if result is not None:
-                results.append(result)
+            # Use Condition-based wait for efficiency
+            with self._output_cv:
+                # Try to pop available results first
+                while len(self._output_queue) > 0 and len(results) < count:
+                    results.append(self._output_queue.popleft())
+
+                if len(results) >= count:
+                    break
+
+                # Wait for notification with timeout
+                wait_time = min(self.poll_sleep_time, remaining)
+                self._output_cv.wait(timeout=wait_time)
 
         # Mark as consumed for capacity tracking
         with self._stats_lock:
@@ -413,19 +432,14 @@ class AsyncRolloutRunner(Generic[T]):
         """
         results: List[TimedResult[T]] = []
 
-        # Wait for first result if timeout > 0
-        if timeout > 0 and len(self._output_queue) == 0:
-            result = self._wait_output_one(timeout)
-            if result is not None:
-                results.append(result)
+        with self._output_cv:
+            # Wait for first result if timeout > 0 and queue is empty
+            if timeout > 0 and len(self._output_queue) == 0:
+                self._output_cv.wait(timeout=timeout)
 
-        # Drain up to max_count (non-blocking)
-        while len(results) < max_count and len(self._output_queue) > 0:
-            result = self._pop_output()
-            if result is not None:
-                results.append(result)
-            else:
-                break
+            # Drain up to max_count
+            while len(results) < max_count and len(self._output_queue) > 0:
+                results.append(self._output_queue.popleft())
 
         if results:
             with self._stats_lock:
@@ -534,45 +548,6 @@ class AsyncRolloutRunner(Generic[T]):
                     current = getattr(self._stats, key)
                     setattr(self._stats, key, max(0, current + delta))
 
-    def _wait_output_one(self, timeout: float) -> Optional[TimedResult[T]]:
-        """Wait for one output result with timeout (thread-safe, blocking).
-
-        This method is called from the main thread to wait for results.
-        It uses polling with short sleeps since the output queue is managed
-        by the async loop in the background thread.
-        """
-        deadline = time.time() + timeout
-        while True:
-            # Try to pop from output queue
-            result = self._pop_output()
-            if result is not None:
-                return result
-
-            # Check timeout
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                return None
-
-            # Short sleep to avoid busy waiting
-            time.sleep(min(0.01, remaining))
-
-    def _pop_output(self) -> Optional[TimedResult[T]]:
-        """Pop one result from output queue (thread-safe, non-blocking)."""
-        # Output queue is only appended from async loop, safe to read length
-        if len(self._output_queue) == 0:
-            return None
-        try:
-            return self._output_queue.popleft()
-        except IndexError:
-            return None
-
-    def _pop_input(self) -> Optional[_TaskInput]:
-        """Pop one task from input queue (thread-safe, non-blocking)."""
-        with self._input_lock:
-            if len(self._input_queue) == 0:
-                return None
-            return self._input_queue.popleft()
-
     def _run_thread(self) -> None:
         """Entry point for background thread."""
         try:
@@ -591,6 +566,9 @@ class AsyncRolloutRunner(Generic[T]):
         finally:
             self._exiting.set()
             self._loop_ready.set()
+            # Wake up waiting threads
+            with self._output_cv:
+                self._output_cv.notify_all()
             if self._loop is not None:
                 self._loop.close()
                 self._loop = None
@@ -737,6 +715,7 @@ class AsyncRolloutRunner(Generic[T]):
         # Wrap results with timing info
         complete_time = time.monotonic_ns()
 
+        results_to_add = []
         for result in results:
             timed_result = TimedResult(
                 data=result,
@@ -745,12 +724,18 @@ class AsyncRolloutRunner(Generic[T]):
                 create_time=task_input.create_time,
                 complete_time=complete_time,
             )
-            # Append to output deque (thread-safe for single writer)
-            if len(self._output_queue) >= self.max_queue_size:
-                logger.warning('Output queue full, dropping result')
-                self._update_stats(running=-1, rejected=1)
-                return
-            self._output_queue.append(timed_result)
+            results_to_add.append(timed_result)
+
+        # Add to output queue and notify waiting threads
+        with self._output_cv:
+            for timed_result in results_to_add:
+                if len(self._output_queue) >= self.max_queue_size:
+                    logger.warning('Output queue full, dropping result')
+                    self._update_stats(running=-1, rejected=1)
+                    return
+                self._output_queue.append(timed_result)
+            # Notify waiting threads
+            self._output_cv.notify_all()
 
         self._update_stats(running=-1, accepted=1)
 
@@ -763,15 +748,26 @@ class AsyncRolloutRunner(Generic[T]):
 
         # Double-check pattern to avoid race condition
         while not self._exiting.is_set() and not self._paused.is_set():
-            if len(self._input_queue) > 0:
-                return
+            with self._input_lock:
+                if len(self._input_queue) > 0:
+                    return
             signal.clear()
-            if len(self._input_queue) > 0 or self._exiting.is_set():
+            with self._input_lock:
+                if len(self._input_queue) > 0:
+                    return
+            if self._exiting.is_set():
                 return
             try:
                 await asyncio.wait_for(signal.wait(), timeout=self.poll_sleep_time)
             except asyncio.TimeoutError:
                 pass
+
+    def _pop_input(self) -> Optional[_TaskInput]:
+        """Pop one task from input queue (thread-safe, non-blocking)."""
+        with self._input_lock:
+            if len(self._input_queue) == 0:
+                return None
+            return self._input_queue.popleft()
 
 
 # ==================== Factory Function ====================
