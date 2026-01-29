@@ -77,9 +77,29 @@ class MegatronRLHF(MegatronSft):
         return vllm_client
 
     def _prepare_teacher_api_client(self):
-        """Prepare teacher API client for external teacher model service."""
+        """Prepare teacher API client for external teacher model service.
+
+        In Megatron with pure Data Parallel (TP=PP=CP=1), each rank processes different data
+        and needs its own API client. With model parallelism (TP/PP/CP > 1), one rank per
+        model parallel group calls the API and broadcasts results.
+        """
         from swift.rlhf_trainers.utils import create_teacher_api_client
-        return create_teacher_api_client(self.args, check_health=True, timeout=60, use_last_rank=True)
+
+        # Check if using pure data parallelism (no model parallelism)
+        tp = getattr(self.args, 'tensor_model_parallel_size', 1)
+        pp = getattr(self.args, 'pipeline_model_parallel_size', 1)
+        cp = getattr(self.args, 'context_parallel_size', 1)
+        is_pure_dp = (tp == 1 and pp == 1 and cp == 1)
+
+        # In pure DP mode, each rank has different data and needs its own client
+        # In MP mode, only last rank creates client and broadcasts results
+        return create_teacher_api_client(
+            self.args,
+            check_health=True,
+            timeout=60,
+            use_last_rank=True,
+            tokenizer=self.template.tokenizer,
+            all_ranks=is_pure_dp)
 
 
 def megatron_rlhf_main(args: Optional[Union[List[str], MegatronRLHFArguments]] = None):

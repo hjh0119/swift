@@ -235,13 +235,21 @@ class SwiftRLHF(SwiftSft):
             if self.args.teacher_deepspeed:
                 trainer_kwargs['teacher_deepspeed_config'] = self.args.teacher_deepspeed
             # Pass GKD-specific args to trainer
-            trainer_kwargs['teacher_model_server'] = self.args.teacher_model_server
             trainer_kwargs['gkd_logits_topk'] = self.args.gkd_logits_topk
             # Initialize teacher API client if using external teacher service
             if self.args.teacher_model_server:
+                # Pass teacher_model_server so trainer knows to use API mode on all ranks
+                trainer_kwargs['teacher_model_server'] = self.args.teacher_model_server
                 from swift.rlhf_trainers.utils import create_teacher_api_client
+                # In DP mode (DeepSpeed/FSDP), each rank has different data and needs its own client
+                # Use all_ranks=True so every rank can independently fetch teacher logprobs
                 trainer_kwargs['teacher_api_client'] = create_teacher_api_client(
-                    self.args, check_health=False, timeout=60, use_last_rank=False)
+                    self.args,
+                    check_health=True,
+                    timeout=60,
+                    use_last_rank=False,
+                    tokenizer=self.template.tokenizer,
+                    all_ranks=True)
         return trainer_kwargs
 
 

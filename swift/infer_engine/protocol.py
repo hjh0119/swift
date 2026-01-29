@@ -173,6 +173,7 @@ class RequestConfig:
     stream: bool = False
     logprobs: bool = False
     top_logprobs: Optional[int] = None
+    prompt_logprobs: Optional[int] = None  # Set to an integer to get top-k logprobs for each prompt token
 
     n: int = 1
     best_of: Optional[int] = None
@@ -192,7 +193,6 @@ class RequestConfig:
 @dataclass
 class CompletionRequestMixin:
     model: str
-    prompt: str
 
 
 @dataclass
@@ -393,11 +393,14 @@ class ChatCompletionResponseChoice:
     finish_reason: Literal['stop', 'length', None]
     logprobs: Optional[Dict[str, List[Dict[str, Any]]]] = None
     token_ids: Optional[List[int]] = None
+    # Logprobs for prompt tokens (when prompt_logprobs is requested)
+    prompt_logprobs: Optional[List[Dict[str, Any]]] = None
 
     def to_cmpl_choice(self) -> 'CompletionResponseChoice':
         self = deepcopy(self)
         assert not self.message.tool_calls, f'message: {self.message}'
-        return CompletionResponseChoice(self.index, self.message.content, self.finish_reason, self.logprobs)
+        return CompletionResponseChoice(self.index, self.message.content, self.finish_reason, self.logprobs,
+                                        self.prompt_logprobs)
 
 
 @dataclass
@@ -423,6 +426,8 @@ class CompletionResponseChoice:
     text: str
     finish_reason: Literal['stop', 'length', None]
     logprobs: Optional[Dict[str, List[Dict[str, Any]]]] = None
+    # Logprobs for prompt tokens (when prompt_logprobs is requested)
+    prompt_logprobs: Optional[List[Dict[str, Any]]] = None
 
 
 @dataclass

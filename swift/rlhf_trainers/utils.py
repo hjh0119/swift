@@ -1453,7 +1453,12 @@ def check_vllm_version_ge(min_version: str) -> bool:
     return version.parse(vllm_version) >= version.parse(min_version)
 
 
-def create_teacher_api_client(args, check_health: bool = True, timeout: int = 60, use_last_rank: bool = True):
+def create_teacher_api_client(args,
+                              check_health: bool = True,
+                              timeout: int = 60,
+                              use_last_rank: bool = True,
+                              tokenizer=None,
+                              all_ranks: bool = False):
     """
     Create and initialize TeacherAPIClient for external teacher model service.
 
@@ -1461,7 +1466,9 @@ def create_teacher_api_client(args, check_health: bool = True, timeout: int = 60
         args: Arguments object containing teacher_model_server and gkd_logits_topk
         check_health: Whether to check server health after creation (default: True)
         timeout: Timeout for health check in seconds (default: 60)
-        use_last_rank: Whether to use last rank (Megatron style) or first rank (Swift style) for initialization (default: True)
+        use_last_rank: Whether to use last rank or first rank  for initialization (default: True)
+        tokenizer: Optional tokenizer for decoding token IDs to text (required for swift deploy API)
+        all_ranks: If True, initialize client on all ranks (for DP mode where each rank needs its own client)
 
     Returns:
         TeacherAPIClient instance or None if teacher_model_server is not set
@@ -1477,19 +1484,29 @@ def create_teacher_api_client(args, check_health: bool = True, timeout: int = 60
     logger = get_logger()
     gkd_logits_topk = getattr(args, 'gkd_logits_topk', None) or 20
 
-    # Choose rank check function based on context
-    rank_check_func = is_last_rank if use_last_rank else is_master
+    # Determine if this rank should create the client
+    if all_ranks:
+        # In DP mode, each rank has different data and needs its own client
+        should_create = True
+    else:
+        # In MP mode, only one rank creates the client and broadcasts results
+        rank_check_func = is_last_rank if use_last_rank else is_master
+        should_create = rank_check_func()
 
     teacher_api_client = None
-    if rank_check_func():
+    if should_create:
         logger.info(f'Initializing teacher API client for {teacher_model_server}')
         teacher_api_client = TeacherAPIClient(
             base_url=teacher_model_server,
             top_logprobs=gkd_logits_topk,
+            tokenizer=tokenizer,
         )
-        if check_health:
-            # Check server health with timeout
-            teacher_api_client.check_server_health(timeout=timeout)
+        # Only master rank does health check to avoid duplicate checks
+        if check_health and is_master():
+            is_healthy = teacher_api_client.check_server_health(timeout=timeout)
+            if not is_healthy:
+                raise ConnectionError(f'Failed to connect to teacher model server at {teacher_model_server}. '
+                                      'Please ensure the server is running and accessible.')
         logger.info(f'Teacher API client initialized with top_logprobs={gkd_logits_topk}')
     return teacher_api_client
 
