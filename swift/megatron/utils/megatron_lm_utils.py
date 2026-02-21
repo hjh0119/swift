@@ -418,7 +418,12 @@ def load_mcore_checkpoint(args,
         gen_sd_optim = optimizer
         gen_sd_opt_param_scheduler = opt_param_scheduler
 
-        if args.use_distributed_optimizer and ckpt_tp_pp != run_tp_pp:
+        if (args.use_distributed_optimizer and ckpt_tp_pp != run_tp_pp
+                and (sharded_sd_metadata or {}).get('distrib_optim_sharding_type') not in {
+                    'fully_reshardable',
+                    'fully_sharded_model_space',
+                    'fsdp_dtensor',
+                }):
             raise RuntimeError(f'{mismatch_msg}: not supported for DistributedOptimizer')
     else:
         gen_sd_optim, gen_sd_opt_param_scheduler = None, None
