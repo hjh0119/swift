@@ -7,6 +7,7 @@ import random
 from argparse import Namespace
 from contextlib import contextmanager
 from datetime import timedelta
+from typing import Optional
 
 import megatron.core
 import numpy as np
@@ -114,7 +115,7 @@ def initialize_megatron(args):
         from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
         MoEAuxLossAutoScaler.set_loss_scale(torch.ones(1, device=torch.cuda.current_device()))
 
-    # TODO: tp_comm_overlap, _compile_dependencies
+    # TODO: tp_comm_overlap
 
 
 def _get_rng_state():
@@ -242,13 +243,17 @@ def get_sharded_sd_metadata(args):
     return sharded_sd_metadata
 
 
-def save_mcore_checkpoint(args,
-                          models,
-                          optimizer=None,
-                          opt_param_scheduler=None,
-                          iteration=1,
-                          is_peft_format: bool = False):
-    output_dir = args.output_dir
+def save_mcore_checkpoint(
+    args,
+    models,
+    optimizer=None,
+    opt_param_scheduler=None,
+    iteration=1,
+    output_dir: Optional[str] = None,
+    is_peft_format: bool = False,
+):
+    if output_dir is None:
+        output_dir = args.output_dir
     models = unwrap_model(models)
     rng_state = _get_rng_state() if models else None
     checkpoint_dir = os.path.join(output_dir, f'iter_{iteration:07d}')
@@ -298,7 +303,6 @@ def save_mcore_checkpoint(args,
     if is_master():
 
         def iter_finalize_fn():
-            # TODO: save_total_limit
             if models:
                 logger.info(f'Successfully saved Megatron model weights in `{output_dir}`.')
 
