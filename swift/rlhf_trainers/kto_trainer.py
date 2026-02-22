@@ -1,10 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from typing import Dict, Optional, Union
-
 import torch
 import torch.nn as nn
+import trl
+from packaging import version
 from peft import PeftModel
 from transformers import PreTrainedModel
+from typing import Dict, Optional, Union
 
 from swift.trainers import SwiftMixin, disable_gradient_checkpointing
 from swift.utils import get_logger
@@ -12,9 +13,9 @@ from .rlhf_mixin import RLHFTrainerMixin
 
 logger = get_logger()
 
-try:
+if version.parse(trl.__version__) >= version.parse('0.26.0'):
     from trl.experimental.kto import KTOTrainer as HFKTOTrainer
-except ImportError:
+else:
     from trl import KTOTrainer as HFKTOTrainer
 
 del HFKTOTrainer.__init__

@@ -1,18 +1,15 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import dataclasses
 import logging
+import megatron.core
 import operator
 import os
 import shutil
+import torch
+import torch.nn
 from abc import ABC, abstractmethod
 from contextlib import contextmanager, nullcontext
 from functools import partial
-from pathlib import Path
-from typing import Callable, Dict, List, Optional
-
-import megatron.core
-import torch
-import torch.nn
 from megatron.core import mpu
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
@@ -22,6 +19,8 @@ from megatron.core.transformer.moe.moe_utils import track_moe_metrics
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from modelscope import check_local_model_is_latest
 from packaging import version
+from pathlib import Path
+from typing import Callable, Dict, List, Optional
 
 from swift.megatron.callbacks import megatron_callbacks_map
 from swift.megatron.model import get_mcore_model
