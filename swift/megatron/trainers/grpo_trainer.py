@@ -232,7 +232,6 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                 args.data_parallel_random_init,
                 args.te_rng_tracker,
             )
-            # TODO: VPP (Virtual Pipeline Parallelism)
             resample_data_iterator = self._prepare_data_iterator(train_dataset, use_origin_cyclic=True)[0]
         finally:
             set_random_seed(
@@ -243,11 +242,13 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         return resample_data_iterator
 
     def _replace_data_iterator(self, data_iterator):
+        is_vpp = isinstance(data_iterator, list)
         if self._step % self.steps_per_generation == 0:
             num_iters_per_step = self.get_num_iters_per_step()
             rollout_batch = []
+            source_iterator = data_iterator[0] if is_vpp else data_iterator
             for _ in range(num_iters_per_step):
-                rollout_batch.extend(next(data_iterator))
+                rollout_batch.extend(next(source_iterator))
             micro_batch_data = self._generate_and_score_completions(rollout_batch)
             num_mini_batch = self.global_batch_size // (self.micro_batch_size * mpu.get_data_parallel_world_size())
             mini_batch_data = [
@@ -257,6 +258,8 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             self._buffered_inputs = mini_batch_data
         inputs = self._buffered_inputs[self._step % self.steps_per_generation]
         self._step += 1
+        if is_vpp:
+            return [RerunDataIterator(iter(inputs)) for _ in data_iterator]
         return RerunDataIterator(iter(inputs))
 
     def _batch_encode(self, infer_requests: List[Dict], template: Template, strict: bool, **kwargs):
@@ -942,25 +945,20 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         inputs = self._prepare_model_inputs(batch)
         if self.beta != 0.0:
             with torch.no_grad(), self.null_ref_context() as ref_models:
-                assert len(ref_models) == 1, 'GRPO currently does not support VPP.'
-                ref_model = ref_models[0]
                 ref_per_token_logps_raw = self.model_forward(
-                    ref_model, iter([deepcopy(inputs)]), no_grad=True, per_token=True)['logps']
+                    ref_models, deepcopy(inputs), no_grad=True, per_token=True)['logps']
                 if self.template.padding_free:
-                    # In padding_free mode, logps are in rmpad format [1, total_tokens]
-                    # Pad to batch format [batch_size, max_seq_len]
                     ref_per_token_logps, _ = pad_logps_back_to_batch(
                         logps_rmpad=ref_per_token_logps_raw,
                         logits_to_keep=max_seq_len,
                         batch_size=batch_size,
                         seq_lengths=seq_lengths)
                 else:
-                    # In non-padding_free mode, logps are already in batch format [batch_size, seq_len]
                     ref_per_token_logps = ref_per_token_logps_raw
                 batch['ref_per_token_logps'] = ref_per_token_logps
 
         old_per_token_logps_raw = self.model_forward(
-            self.unwrapped_models[0], iter([deepcopy(inputs)]), no_grad=True, per_token=True)['logps']
+            self.unwrapped_models, deepcopy(inputs), no_grad=True, per_token=True)['logps']
         if self.template.padding_free:
             old_per_token_logps, _ = pad_logps_back_to_batch(
                 logps_rmpad=old_per_token_logps_raw,
@@ -1039,11 +1037,16 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
     @profiling_decorator
     def forward_step(self, data_iterator, model):
         args = self.args
+        unwrapped_model = model.module.module
+        input_tensor = unwrapped_model.get_input_tensor()
+        vp_stage = unwrapped_model.vp_stage
+
         data = next(data_iterator)
-        advantages = data.pop('advantages')
-        truncated_mask = data.pop('truncated_mask')
-        seq_lengths = data.pop('seq_lengths')
-        data = self._prepare_batch(data)
+        advantages = data['advantages']
+        truncated_mask = data['truncated_mask']
+        seq_lengths = data['seq_lengths']
+        batch = {k: v for k, v in data.items() if k not in ('advantages', 'truncated_mask', 'seq_lengths')}
+        data = self._prepare_batch(batch, vp_stage)
         data.update({
             'advantages': advantages,
             'truncated_mask': truncated_mask,
@@ -1057,16 +1060,15 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         max_seq_len = data['completion_mask'].shape[1]
         micro_batch_size = self.micro_batch_size
 
-        # Check if this is the PP last stage (only last stage has labels and computes loss)
-        is_pp_last_stage = mpu.is_pipeline_last_stage()
+        if input_tensor is not None:
+            unwrapped_model.set_input_tensor(input_tensor)
 
         if self.compute_entropy:
             # Forward without labels to get logits, then compute logps and entropy
             inputs_for_logits = {k: v for k, v in inputs.items() if k != 'labels'}
             output_tensor = model(**inputs_for_logits)
 
-            # Compute per_token_logps and per_token_entropy from logits on PP last stage
-            if is_pp_last_stage and output_tensor is not None:
+            if labels is not None and output_tensor is not None:
                 # output_tensor is logits [batch/1, seq, partition_vocab_size]
                 per_token_logps_raw, per_token_entropy_raw = compute_logps_and_entropy_from_logits(
                     output_tensor, labels, compute_entropy=True)
@@ -1102,8 +1104,7 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             # Standard forward with labels, returns per-token loss (more efficient)
             output_tensor = model(**inputs)
 
-            # Convert output_tensor (per-token loss) to per_token_logps on PP last stage
-            if is_pp_last_stage and output_tensor is not None:
+            if labels is not None and output_tensor is not None:
                 per_token_logps_raw = self.get_logps(
                     output_tensor,
                     labels,
@@ -1418,36 +1419,40 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
 
         return loss, reporting_metric
 
-    def model_forward(self, model, data_iterator, no_grad=True, per_token=False):
-        """Forward pass through model to compute logps.
+    def model_forward(self, models, raw_inputs, no_grad=True, per_token=False):
+        """Forward pass through model(s) to compute logps, outside pipeline schedule.
+
+        Unlike forward_step (called by pipeline schedule), this calls get_batch
+        without vp_stage so all PP ranks keep full data (input_ids and labels).
+        This is necessary because forward_step_helper handles data flow between
+        stages internally, and the last-stage rank needs labels to compute logps.
 
         Args:
-            model: The model to forward
-            data_iterator: Iterator providing batch data
-            no_grad: Whether to use torch.no_grad() context
-            per_token: Whether to return per-token logps
+            models: A single model or a list of model chunks (VPP).
+            raw_inputs: Raw input dict (before _prepare_batch).
+            no_grad: Whether to use torch.no_grad() context.
+            per_token: Whether to return per-token logps.
 
         Returns:
-            data dict containing 'logps'
+            data dict containing 'logps'.
         """
-        # used to calculate model forward (logps) in GRPO
-        data = self.get_batch(data_iterator)
+        data = self._prepare_batch_for_pipeline_helper(deepcopy(raw_inputs))
         data.pop('loss_scale', None)
         input_ids = data.get('input_ids')
         labels = data.get('labels')
         context = torch.no_grad() if no_grad else nullcontext()
 
         with context:
-            output_tensor = forward_step_helper(self.args, model, data)
+            output_tensor = forward_step_helper(self.args, models, data)
 
-        # packed_seq_params only exists in padding_free mode
         packed_seq_params = data.get('packed_seq_params')
         if packed_seq_params is not None:
             num_samples = packed_seq_params.num_samples
         else:
             num_samples = input_ids.shape[0] if input_ids is not None else labels.shape[0]
-        data['logps'] = None if labels is None else self.get_logps(
+        data['logps'] = None if output_tensor is None else self.get_logps(
             output_tensor, labels, packed_seq_params, num_samples, per_token=per_token)
+
         return data
 
     def inputs2requests(self, inputs: Union[DataType, List[RolloutInferRequest]]) -> List[RolloutInferRequest]:

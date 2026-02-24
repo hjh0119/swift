@@ -265,34 +265,49 @@ def copy_ref_adapter_weight(model, ref_adapter_name: str):
                 sub_module[ref_adapter_name].load_state_dict(sub_module['default'].state_dict())
 
 
-def forward_step_helper(args, model, inputs, dtype=None):
-    config = model.config
-    if mpu.is_pipeline_first_stage():
-        micro_batch_size = 1  # use qkv_format 'thd'
-        if not args.padding_free:
-            micro_batch_size = args.micro_batch_size
-        seq_length = inputs['position_ids'].shape[-1]
-        if config.sequence_parallel:
-            seq_length //= mpu.get_tensor_model_parallel_world_size()
-        recv_shape_buffer = torch.tensor([seq_length, micro_batch_size, config.hidden_size],
-                                         device=torch.cuda.current_device(),
-                                         dtype=torch.int64)
-    else:
-        recv_shape_buffer = torch.empty((3, ), device=torch.cuda.current_device(), dtype=torch.int64)
-        recv_from_prev_pipeline_rank_(recv_shape_buffer)
-    if not mpu.is_pipeline_last_stage():
-        send_to_next_pipeline_rank(recv_shape_buffer)
-    shape = recv_shape_buffer.tolist()
+def forward_step_helper(args, models, inputs, dtype=None):
+    if not isinstance(models, (list, tuple)):
+        models = [models]
 
-    if not mpu.is_pipeline_first_stage():
-        dtype = dtype or config.params_dtype
-        recv_buffer = torch.empty(shape, device=torch.cuda.current_device(), dtype=dtype)
-        recv_from_prev_pipeline_rank_(recv_buffer)
-        model.set_input_tensor(recv_buffer)
-    output_tensor = model(**inputs)
-    if not mpu.is_pipeline_last_stage():
-        send_to_next_pipeline_rank(output_tensor)
-        output_tensor = None
+    pp_size = mpu.get_pipeline_model_parallel_world_size()
+    pp_rank = mpu.get_pipeline_model_parallel_rank()
+    num_chunks = len(models)
+    output_tensor = None
+
+    for chunk_idx, model in enumerate(models):
+        config = model.config
+        global_stage = chunk_idx * pp_size + pp_rank
+        is_global_first = (global_stage == 0)
+        is_global_last = (global_stage == num_chunks * pp_size - 1)
+
+        if is_global_first:
+            micro_batch_size = 1  # use qkv_format 'thd'
+            if not args.padding_free:
+                micro_batch_size = args.micro_batch_size
+            seq_length = inputs['position_ids'].shape[-1]
+            if config.sequence_parallel:
+                seq_length //= mpu.get_tensor_model_parallel_world_size()
+            recv_shape_buffer = torch.tensor([seq_length, micro_batch_size, config.hidden_size],
+                                             device=torch.cuda.current_device(),
+                                             dtype=torch.int64)
+        else:
+            recv_shape_buffer = torch.empty((3, ), device=torch.cuda.current_device(), dtype=torch.int64)
+            recv_from_prev_pipeline_rank_(recv_shape_buffer)
+        if not is_global_last:
+            send_to_next_pipeline_rank(recv_shape_buffer)
+        shape = recv_shape_buffer.tolist()
+
+        if not is_global_first:
+            dtype_ = dtype or config.params_dtype
+            recv_buffer = torch.empty(shape, device=torch.cuda.current_device(), dtype=dtype_)
+            recv_from_prev_pipeline_rank_(recv_buffer)
+            model.set_input_tensor(recv_buffer)
+
+        output_tensor = model(**inputs)
+
+        if not is_global_last:
+            send_to_next_pipeline_rank(output_tensor)
+            output_tensor = None
 
     return output_tensor
 

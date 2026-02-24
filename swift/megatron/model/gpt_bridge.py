@@ -1417,15 +1417,26 @@ class GPTBridge:
                 mg_layer_available = (start_idx <= layer_idx < lm_model.decoder.layers[-1].layer_number)
             else:
                 mg_layer_available = False
-            if mg_layer_available:
-                mg_layer = lm_model.decoder.layers[layer_idx - start_idx]
-            else:
+            if not mg_layer_available:
                 if to_mcore:
-                    layer_idx += 1
-                    prog_bar.update()
-                    continue
+                    try:
+                        mg_model = next(mg_models)
+                    except StopIteration:
+                        layer_idx += 1
+                        prog_bar.update()
+                        continue
+                    lm_model = getattr(mg_model, 'language_model') if self.is_multimodal else mg_model
+                    if len(lm_model.decoder.layers) > 0:
+                        start_idx = lm_model.decoder.layers[0].layer_number - 1
+                        mg_layer_available = (start_idx <= layer_idx < lm_model.decoder.layers[-1].layer_number)
+                    if not mg_layer_available:
+                        layer_idx += 1
+                        prog_bar.update()
+                        continue
                 else:
                     mg_layer = None
+            if mg_layer_available:
+                mg_layer = lm_model.decoder.layers[layer_idx - start_idx]
             if not to_mcore and self.pp_size > 1:
                 has_model = torch.tensor([mg_layer is not None], dtype=torch.bool, device='cuda')
                 dist.all_reduce(has_model, group=self.pp_group)
@@ -1441,6 +1452,8 @@ class GPTBridge:
                 yield from list(self._add_prefix(res, hf_prefix).items())
                 hf_state_dict = {}
 
+        if mcore_013:
+            is_pp_last_stage = mpu.is_pipeline_last_stage(ignore_virtual=False, vp_stage=mg_model.vp_stage)
         if (not to_mcore or is_pp_last_stage) and self.config.mtp_num_layers:
             lm_model = getattr(mg_model, 'language_model') if self.is_multimodal else mg_model
             if to_mcore and self.pp_rank > 0:

@@ -68,8 +68,6 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
     def prepare_model(self):
         super().prepare_model()
         args = self.args
-        vp_size = getattr(args, 'virtual_pipeline_model_parallel_size')
-        assert vp_size is None or vp_size == 1, 'GKD currently does not support VPP.'
         self.teacher_models = get_mcore_model(args, self.teacher_config)
         for teacher_model in self.teacher_models:
             teacher_model.requires_grad_(False)
@@ -246,25 +244,21 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
 
         return valid_samples[:required_count]
 
-    def _compute_teacher_logits(self, encoded_batches: List[Dict], vp_stage: Optional[int] = None) -> None:
-        teacher_model = self.teacher_models[vp_stage or 0]
-
+    def _compute_teacher_logits(self, encoded_batches: List[Dict]) -> None:
         for encoded_batch in encoded_batches:
-            # Deep copy to avoid modifying original batch
             teacher_batch = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in encoded_batch.items()}
             teacher_batch.pop('data_source', None)
-            teacher_data = self._prepare_batch(teacher_batch)
+            teacher_data = self._prepare_batch_for_pipeline_helper(teacher_batch)
             teacher_data.pop('loss_scale', None)
-            # Remove labels so returns logits instead of loss
             teacher_data.pop('labels', None)
-            # Teacher forward with args override for correct hidden_size
             with self.load_teacher_model_context(), torch.no_grad():
-                teacher_logits = forward_step_helper(self.args, teacher_model, teacher_data)
+                teacher_logits = forward_step_helper(self.args, self.teacher_models, teacher_data)
                 if teacher_logits is not None:
                     teacher_logits = teacher_logits.detach()
             encoded_batch['teacher_logits'] = teacher_logits
 
     def _replace_data_iterator(self, data_iterator):
+        is_vpp = isinstance(data_iterator, list)
         num_microbatches = self.args.num_microbatches
 
         # Determine data source once for the entire global batch
@@ -272,8 +266,9 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
 
         # Collect all micro-batches into a global batch
         global_batch = []
+        source_iterator = data_iterator[0] if is_vpp else data_iterator
         for _ in range(num_microbatches):
-            raw_batch = next(data_iterator)
+            raw_batch = next(source_iterator)
 
             # Resample for encoding failed data when truncation_strategy is 'delete'
             if self.truncation_strategy == 'delete' and self.resample_data_iterator is not None:
@@ -307,7 +302,10 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         # Increment step counter (used for deterministic random and weight sync)
         self._step += 1
 
-        return RerunDataIterator(iter(encoded_batches))
+        rerun_iter = RerunDataIterator(iter(encoded_batches))
+        if is_vpp:
+            return [rerun_iter] * len(data_iterator)
+        return rerun_iter
 
     def _align_vocab_size(
         self,
@@ -433,7 +431,8 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                   *,
                   labels: torch.Tensor,
                   teacher_logits: torch.Tensor,
-                  data_source: DataSource = DataSource.DATASET):
+                  data_source: DataSource = DataSource.DATASET,
+                  unwrapped_model=None):
         """Compute GKD loss (JSD + optional SFT loss).
 
         Args:
@@ -441,6 +440,7 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             labels: Token labels for masking [batch, seq_len]
             teacher_logits: Teacher model logits [batch, seq_len, vocab_size]
             data_source: Data source (STUDENT/TEACHER/DATASET) for conditional SFT loss
+            unwrapped_model: The unwrapped model chunk for compute_language_model_loss (VPP-aware)
         """
         student_logits = output_tensor
 
@@ -457,8 +457,9 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         sft_loss = None
         if self.sft_alpha > 0 and data_source != DataSource.STUDENT:
             args = self.args
+            sft_model = unwrapped_model or self.unwrapped_models[0]
             logits_sbv = student_logits.transpose(0, 1).contiguous()
-            per_token_loss = self.unwrapped_models[0].compute_language_model_loss(labels, logits_sbv)
+            per_token_loss = sft_model.compute_language_model_loss(labels, logits_sbv)
 
             loss_mask = labels != -100
             sft_loss_sum = (per_token_loss * loss_mask).sum()
@@ -503,4 +504,8 @@ class MegatronGKDTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
         student_output = model(**data)
 
         return student_output, partial(
-            self.loss_func, labels=labels, teacher_logits=teacher_logits, data_source=data_source)
+            self.loss_func,
+            labels=labels,
+            teacher_logits=teacher_logits,
+            data_source=data_source,
+            unwrapped_model=unwrapped_model)

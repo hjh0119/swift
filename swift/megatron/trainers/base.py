@@ -32,7 +32,7 @@ from swift.megatron.utils import (copy_original_module_weight, get_optimizer_par
 from swift.template import Template
 from swift.trainers import dynamic_gradient_checkpointing
 from swift.trainers.utils import patch_modelscope_hub_timeout
-from swift.utils import deep_getattr, get_last_valid_indices, get_logger, is_last_rank, ms_logger_context
+from swift.utils import deep_getattr, get_last_valid_indices, get_logger, is_last_rank, ms_logger_context, to_device
 from .batch_sampler import MegatronPretrainingRandomSampler, MegatronPretrainingSampler
 from .utils import (TrainerState, build_streaming_dataloader, get_batch_on_this_cp_rank, get_batch_on_this_tp_rank,
                     get_packed_seq_params)
@@ -796,6 +796,35 @@ class BaseMegatronTrainer(ABC):
             batch['packed_seq_params'] = get_packed_seq_params(text_position_ids)
             batch['packed_seq_params'].num_samples = num_samples
         # slice batch along sequence dimension for context parallelism
+        batch = get_batch_on_this_cp_rank(args, batch)
+        return batch
+
+    def _prepare_batch_for_pipeline_helper(self, data, num_samples=None):
+        """Prepare batch for manual PP forward via forward_step_helper.
+
+        Unlike _prepare_batch (used inside pipeline schedule's forward_step),
+        this skips PP-stage-based input_ids/labels pruning. forward_step_helper
+        manages data flow between stages internally: only the global-first
+        stage embeds input_ids, and only the global-last stage uses labels.
+        All ranks keep the full data so that intermediate chunks can still
+        access position_ids (for RoPE) and the last stage can compute logps.
+        """
+        if self.args.task_type == 'causal_lm':
+            data['labels'] = torch.roll(data['labels'], -1, dims=-1)
+            if 'loss_scale' in data:
+                data['loss_scale'] = torch.roll(data['loss_scale'], -1, dims=-1)
+        batch = to_device(data, 'cuda', non_blocking=True)
+        if num_samples is None:
+            num_samples = batch.pop('num_samples', None)
+        args = self.args
+        text_position_ids = batch.pop('text_position_ids', None)
+        batch.pop('attention_mask_2d', None)
+        if text_position_ids is None:
+            text_position_ids = batch.get('position_ids')
+        if args.padding_free and text_position_ids is not None:
+            batch['packed_seq_params'] = get_packed_seq_params(text_position_ids)
+            if num_samples is not None:
+                batch['packed_seq_params'].num_samples = num_samples
         batch = get_batch_on_this_cp_rank(args, batch)
         return batch
 
