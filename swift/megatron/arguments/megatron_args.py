@@ -426,9 +426,11 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
 
     sequence_parallel: bool = False
     context_parallel_size: int = 1
-    tp_comm_overlap: bool = False  # TODO
-    overlap_grad_reduce: bool = False  # TODO
-    overlap_param_gather: bool = False  # TODO
+    tp_comm_overlap: bool = False
+    overlap_grad_reduce: bool = False
+    overlap_param_gather: bool = False
+    overlap_param_gather_with_optimizer_step: bool = False
+    align_grad_reduce: bool = True
     virtual_pipeline_model_parallel_size: Optional[int] = None
     microbatch_group_size_per_vp_stage: Optional[int] = None
     pipeline_model_parallel_layout: Optional[str] = None
