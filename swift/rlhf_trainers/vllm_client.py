@@ -9,8 +9,10 @@ from dataclasses import asdict
 from packaging import version
 from pydantic import ValidationError
 from requests import ConnectionError
+from requests.adapters import HTTPAdapter
 from torch import nn
 from typing import List, Optional, Union
+from urllib3.util.retry import Retry
 from urllib.parse import urlparse
 
 from swift.infer_engine import AdapterRequest, RequestConfig
@@ -67,7 +69,24 @@ class VLLMClient:
         if group_ports is None:
             group_ports = [51216 + i for i in range(self.num_servers)]
 
-        self.sessions = [requests.Session() for _ in range(self.num_servers)]
+        # follow https://github.com/huggingface/trl/pull/4845
+        retry_strategy = Retry(
+            total=5,
+            connect=5,
+            read=5,
+            status=3,
+            status_forcelist=[500, 502, 503],
+            backoff_factor=2,
+            allowed_methods=['POST', 'GET'],
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+
+        self.sessions = []
+        for _ in range(self.num_servers):
+            session = requests.Session()
+            session.mount('http://', adapter)
+            session.mount('https://', adapter)
+            self.sessions.append(session)
 
         if isinstance(group_ports, int):
             self.group_ports = [group_ports + i for i in range(self.num_servers)]
