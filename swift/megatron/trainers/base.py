@@ -567,6 +567,7 @@ class BaseMegatronTrainer(ABC):
         while state.iteration < args.train_iters:
             self.call_event('on_step_begin')
             maybe_finalize_async_save(args, blocking=False)
+            self.on_train_step_start(state.iteration, train_data_iterator)
             metrics, grad_norm, update_successful = self.train_step(train_data_iterator)
             if state.iteration == start_iteration:
                 if update_successful:
@@ -771,6 +772,18 @@ class BaseMegatronTrainer(ABC):
             for k, v in metric.items():
                 metrics[k] = v if isinstance(v, torch.Tensor) else torch.tensor(v)
             self.eval_metrics.reset()
+
+    def on_train_step_start(self, iteration, data_iterator):
+        """Hook called before each train_step inside the training loop.
+
+        Override in subclasses to inject cross-model-group coordination
+        (e.g. pre-computing ref logps from a remote ref group in Ray mode).
+
+        Args:
+            iteration: Current training iteration (before increment).
+            data_iterator: The training data iterator.
+        """
+        pass
 
     def _replace_data_iterator(self, data_iterator):
         return data_iterator
