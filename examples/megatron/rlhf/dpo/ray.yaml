@@ -1,7 +1,7 @@
 # Ray DPO training configuration
 #
 # Usage:
-#   python -m swift.ray.megatron.orchestrator \
+#   python -m swift.ray.megatron.pipeline \
 #       --config examples/megatron/rlhf/dpo/ray.yaml
 #
 # Structure:
