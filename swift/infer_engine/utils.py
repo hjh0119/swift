@@ -377,6 +377,63 @@ def patch_npu_vllm(vllm_device: str):
     return new_group_context() if device_type == 'npu' else nullcontext()
 
 
+def patch_vllm_triton_device_guard():
+    """Patch vLLM Triton kernels to use explicit CUDA device guard.
+
+    Triton kernel launches implicitly use torch.cuda.current_device() to determine
+    the CUDA context. When torch.compile or CUDA graph capture temporarily shifts
+    the current device, Triton kernels receive pointers from a different device
+    context, causing: ValueError: Pointer argument (at 0) cannot be accessed from
+    Triton (cpu tensor?)
+
+    This patch wraps the Triton kernel call sites with `with torch.cuda.device(tensor.device):`
+    to ensure the correct CUDA context is active during kernel launch.
+    See: https://github.com/modelscope/ms-swift/issues/9130
+    """
+    import functools
+    patched_count = 0
+
+    try:
+        from vllm.model_executor.layers.mamba import gdn_linear_attn as _gdn_mod
+        _orig_fused_gdn = _gdn_mod.fused_gdn_gating
+        if not getattr(_orig_fused_gdn, '_swift_device_guard_patched', False):
+
+            @functools.wraps(_orig_fused_gdn)
+            def _patched_fused_gdn_gating(*args, **kwargs):
+                a = args[1] if len(args) > 1 else kwargs.get('a')
+                with torch.cuda.device(a.device):
+                    return _orig_fused_gdn(*args, **kwargs)
+
+            _patched_fused_gdn_gating._swift_device_guard_patched = True
+            _gdn_mod.fused_gdn_gating = _patched_fused_gdn_gating
+            patched_count += 1
+    except (ImportError, AttributeError):
+        pass
+
+    try:
+        from vllm.model_executor.layers.fla.ops import fused_sigmoid_gating as _sig_mod
+        _orig_fused_sig = _sig_mod.fused_sigmoid_gating_delta_rule_update
+        if not getattr(_orig_fused_sig, '_swift_device_guard_patched', False):
+
+            @functools.wraps(_orig_fused_sig)
+            def _patched_fused_sigmoid(*args, **kwargs):
+                q = args[4] if len(args) > 4 else kwargs.get('q')
+                with torch.cuda.device(q.device):
+                    return _orig_fused_sig(*args, **kwargs)
+
+            _patched_fused_sigmoid._swift_device_guard_patched = True
+            _sig_mod.fused_sigmoid_gating_delta_rule_update = _patched_fused_sigmoid
+            # Also patch the reference imported into gdn_linear_attn module namespace
+            _gdn_mod.fused_sigmoid_gating_delta_rule_update = _patched_fused_sigmoid
+            patched_count += 1
+    except (ImportError, AttributeError):
+        pass
+
+    if patched_count > 0:
+        from swift.utils import get_logger as _get_logger
+        _get_logger().info(f'Patched {patched_count} vLLM Triton kernel(s) with CUDA device guard.')
+
+
 def patch_vllm_memory_leak():
     # fix vllm 0.7.3 memory leak
     # https://github.com/vllm-project/vllm/pull/14326
