@@ -21,8 +21,7 @@ from .patch import patch_auto_tokenizer
 from .protocol import (ChatCompletionResponse, ChatCompletionResponseChoice, ChatCompletionResponseStreamChoice,
                        ChatCompletionStreamResponse, ChatMessage, DeltaMessage, EmbeddingResponse,
                        EmbeddingResponseData, InferRequest, RequestConfig, random_uuid)
-from .utils import (AdapterRequest, InferStreamer, patch_npu_vllm, patch_vllm_memory_leak,
-                     patch_vllm_triton_device_guard)
+from .utils import AdapterRequest, InferStreamer, patch_npu_vllm, patch_vllm_memory_leak, patch_vllm_triton_device_guard
 
 logger = get_logger()
 try:
