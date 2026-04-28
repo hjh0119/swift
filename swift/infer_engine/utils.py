@@ -391,7 +391,6 @@ def patch_vllm_triton_device_guard():
     See: https://github.com/modelscope/ms-swift/issues/9130
     """
     import functools
-    patched_count = 0
 
     try:
         from vllm.model_executor.layers.mamba import gdn_linear_attn as _gdn_mod
@@ -406,7 +405,6 @@ def patch_vllm_triton_device_guard():
 
             _patched_fused_gdn_gating._swift_device_guard_patched = True
             _gdn_mod.fused_gdn_gating = _patched_fused_gdn_gating
-            patched_count += 1
     except (ImportError, AttributeError):
         pass
 
@@ -425,13 +423,8 @@ def patch_vllm_triton_device_guard():
             _sig_mod.fused_sigmoid_gating_delta_rule_update = _patched_fused_sigmoid
             # Also patch the reference imported into gdn_linear_attn module namespace
             _gdn_mod.fused_sigmoid_gating_delta_rule_update = _patched_fused_sigmoid
-            patched_count += 1
     except (ImportError, AttributeError):
         pass
-
-    if patched_count > 0:
-        from swift.utils import get_logger as _get_logger
-        _get_logger().info(f'Patched {patched_count} vLLM Triton kernel(s) with CUDA device guard.')
 
 
 def patch_vllm_memory_leak():
