@@ -26,7 +26,7 @@ from swift.infer_engine.protocol import RequestConfig, RolloutInferRequest, Roll
 from swift.rlhf_trainers.utils import (VLLM_LORA_INT_ID, VLLM_LORA_NAME, VLLM_LORA_PATH, FlattenedTensorBucket,
                                        TensorLoRARequest, add_base_layer_suffix_by_param_names, aggressive_empty_cache,
                                        check_vllm_version_ge, expand_vllm_param_name_aliases, patch_vllm_load_adapter,
-                                       patch_vllm_moe_model_weight_loader, profiling_context, profiling_decorator,
+                                       profiling_context, profiling_decorator,
                                        set_expandable_segments, vllm_supports_lora_load_inplace)
 from swift.utils import (get_current_device, get_logger, is_last_rank, is_vllm_available, remove_response, synchronize,
                          to_device)
@@ -260,6 +260,8 @@ class MegatronRolloutMixin:
 
         vllm_engine_kwargs = args.vllm_engine_kwargs or {}
         load_format = vllm_engine_kwargs.pop('load_format', 'auto')
+        vllm_engine_kwargs.setdefault(
+            'worker_extension_cls', 'swift.pipelines.infer.rollout.WeightSyncWorkerExtension')
 
         if self.args.router_replay_mode == 'R3':
             assert check_vllm_version_ge('0.14.0'), \
@@ -299,6 +301,8 @@ class MegatronRolloutMixin:
             max_lora_rank=max_lora_rank,
             engine_kwargs=vllm_engine_kwargs,
             logprobs_mode=logprobs_mode)
+
+        engine.engine.collective_rpc(method='monkey_patch_model')
 
         if self.vllm_tensor_parallel_size > 1:
             self.vllm_tp_group = vllm_ps.get_tp_group().device_group
@@ -411,7 +415,6 @@ class MegatronRolloutMixin:
 
         if self.vllm_mode == 'colocate':
             llm_model = self.engine.inner_model
-            patch_vllm_moe_model_weight_loader(llm_model)
             llm_model.load_weights(weight_iterator)
         elif self.vllm_mode == 'server':
             self._load_weights_to_server_in_buckets(weight_iterator)

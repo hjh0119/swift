@@ -89,6 +89,21 @@ class WeightSyncWorkerExtension:
     communicator = None  # Communicator for weight updates
     client_rank = None  # Source rank for broadcasting updated weights
 
+    def monkey_patch_model(self):
+        """Apply monkey-patches to the vLLM model after engine initialization.
+
+        Called via ``collective_rpc('monkey_patch_model')`` for both
+        colocate and server modes.  All vLLM model patches should be
+        consolidated here for maintainability.
+        """
+        patch_vllm_moe_model_weight_loader(self.model_runner.model)
+
+        try:
+            from vllm.model_executor.models.qwen3_5 import Qwen3_5MoeForConditionalGeneration
+            Qwen3_5MoeForConditionalGeneration.is_3d_moe_weight = False
+        except ImportError:
+            pass
+
     def init_communicator(self, host: str, port: int, world_size: int) -> None:
         """
         Initializes the weight update communicator using a stateless process group.
@@ -155,9 +170,6 @@ class WeightSyncWorkerExtension:
             weight, src=self.client_rank, stream=getattr(get_torch_device(), 'current_stream', lambda: None)())
         synchronize()
         self.communicator.group.barrier()
-
-        # Patch MoE weight_loader if needed
-        patch_vllm_moe_model_weight_loader(self.model_runner.model)
 
         # Load the received weights into the model.
         self.model_runner.model.load_weights(weights=[(name, weight)])
@@ -252,8 +264,6 @@ class WeightSyncWorkerExtension:
         self.communicator.group.barrier()
 
         named_params = FlattenedTensorBucket(metadata=metadatas, flattened_tensor=flatten_tensor).reconstruct_tensors()
-
-        patch_vllm_moe_model_weight_loader(self.model_runner.model)
         self.model_runner.model.load_weights(weights=list(named_params.items()))
 
     def close_communicator(self) -> None:
@@ -311,6 +321,7 @@ def llm_worker(args: RolloutArguments, data_parallel_rank: int, master_port: int
         os.environ['VLLM_DP_MASTER_PORT'] = str(master_port)
         worker_seed = get_seed()
         engine = SwiftRolloutDeploy.get_infer_engine(args, template=args.get_template(), seed=worker_seed)
+        engine.engine.collective_rpc(method='monkey_patch_model')
         rollout_engine = get_rollout_engine_type(args, engine)
     except Exception:
         connection.send({'status': 'error', 'error': traceback.format_exc()})
@@ -347,6 +358,7 @@ async def async_llm_worker(args: RolloutArguments, data_parallel_rank: int, mast
         args._import_external_plugins()
         worker_seed = get_seed()
         engine = SwiftRolloutDeploy.get_infer_engine(args, template=args.get_template(), seed=worker_seed)
+        await engine.engine.collective_rpc(method='monkey_patch_model')
         rollout_engine = get_rollout_engine_type(args, engine)
     except Exception:
         connection.send({'status': 'error', 'error': traceback.format_exc()})

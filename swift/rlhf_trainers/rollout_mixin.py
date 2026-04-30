@@ -39,7 +39,7 @@ from .utils import (VLLM_LORA_INT_ID, VLLM_LORA_NAME, VLLM_LORA_PATH, FlattenedT
                     _create_parameter_buckets, _process_bucket_with_flattened_tensor,
                     add_base_layer_suffix_by_param_names, aggressive_empty_cache, check_vllm_version_ge,
                     expand_vllm_param_name_aliases, get_even_process_data, get_gather_if_zero3_context,
-                    patch_lora_merge, patch_lora_unmerge, patch_vllm_load_adapter, patch_vllm_moe_model_weight_loader,
+                    patch_lora_merge, patch_lora_unmerge, patch_vllm_load_adapter,
                     profiling_context, profiling_decorator, set_expandable_segments, vllm_supports_lora_load_inplace)
 
 DataType = List[Dict[str, Union[torch.Tensor, Any]]]
@@ -250,6 +250,8 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
             # Use load_format from vllm_engine_kwargs if provided, otherwise default to 'auto'
             vllm_engine_kwargs = self.args.vllm_engine_kwargs or {}
             load_format = vllm_engine_kwargs.pop('load_format', 'auto')
+            vllm_engine_kwargs.setdefault(
+                'worker_extension_cls', 'swift.pipelines.infer.rollout.WeightSyncWorkerExtension')
             engine = GRPOVllmEngine(
                 model.model_dir,
                 torch_dtype=model.model_info.torch_dtype,
@@ -276,6 +278,7 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
             )
             set_expandable_segments(True)
 
+        engine.engine.collective_rpc(method='monkey_patch_model')
         return engine
 
     def split_batches(self):
@@ -507,8 +510,6 @@ class RolloutTrainerMixin(RLHFTrainerMixin):
                     self.vllm_client.update_named_param(name, param)
         elif self.vllm_mode == 'colocate':
             llm_model = self.engine.inner_model
-            # Patch MoE weight_loader if needed
-            patch_vllm_moe_model_weight_loader(llm_model)
             llm_model.load_weights(state_dict.items())
         del state_dict
 
