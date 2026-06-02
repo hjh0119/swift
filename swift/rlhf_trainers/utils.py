@@ -17,7 +17,7 @@ from io import BytesIO
 from msgspec import field
 from packaging import version
 from peft.tuners import lora
-from peft.tuners.lora import LoraLayer
+from peft.tuners.lora import LoraLayer, ParamWrapper
 from PIL import Image
 from pydantic import BaseModel, field_validator
 from torch import nn
@@ -506,6 +506,13 @@ def round_robin(num_reqs, num_workers):
     return distribution
 
 
+def _get_base_weight_device(layer):
+    """Get the device of the base weight, handling both nn.Linear and ParamWrapper (nn.Parameter)."""
+    if isinstance(layer, ParamWrapper):
+        return layer.get_param().device
+    return layer.base_layer.weight.device
+
+
 @contextmanager
 def patch_lora_merge(model, parameter_group=None):
     """Patch LoraLayer's merge and get_delta_weight methods for controlled merging.
@@ -530,23 +537,25 @@ def patch_lora_merge(model, parameter_group=None):
             if active_adapter in self.lora_A.keys():
                 base_layer = self.get_base_layer()
                 if self.use_dora.get(active_adapter, False):
+                    device = _get_base_weight_device(self)
                     self.lora_magnitude_vector[active_adapter].weight.data = \
-                        self.lora_magnitude_vector[active_adapter].weight.data.to(base_layer.weight.device)
+                        self.lora_magnitude_vector[active_adapter].weight.data.to(device)
 
         return self.merge_origin(safe_merge, adapter_names)
 
     def get_delta_weight(self, adapter) -> torch.Tensor:
-        # Ensure tensors are on correct device
+        device = _get_base_weight_device(self)
         if isinstance(self, lora.Embedding):
-            self.lora_embedding_A[adapter].data = self.lora_embedding_A[adapter].data.to(self.base_layer.weight.device)
-            self.lora_embedding_B[adapter].data = self.lora_embedding_B[adapter].data.to(self.base_layer.weight.device)
+            self.lora_embedding_A[adapter].data = self.lora_embedding_A[adapter].data.to(device)
+            self.lora_embedding_B[adapter].data = self.lora_embedding_B[adapter].data.to(device)
         else:
-            self.lora_A[adapter].weight.data = self.lora_A[adapter].weight.data.to(self.base_layer.weight.device)
-            self.lora_B[adapter].weight.data = self.lora_B[adapter].weight.data.to(self.base_layer.weight.device)
-        return self.get_delta_weight_origin(adapter).to(self.base_layer.weight.device)
+            self.lora_A[adapter].weight.data = self.lora_A[adapter].weight.data.to(device)
+            self.lora_B[adapter].weight.data = self.lora_B[adapter].weight.data.to(device)
+        return self.get_delta_weight_origin(adapter).to(device)
 
     def _cache_pop(self, key: str) -> Any:
-        value = self._caches.pop(key).to(self.base_layer.weight.device)
+        device = _get_base_weight_device(self)
+        value = self._caches.pop(key).to(device)
         return value
 
     # Patch all LoraLayer instances
@@ -582,11 +591,11 @@ def patch_lora_unmerge(model):
     def unmerge_patched(self):
         if not self.merged:
             return
-        # Move magnitude vectors to correct device first
+        device = _get_base_weight_device(self)
         for adapter in list(self.merged_adapters):
             if self.use_dora.get(adapter, False):
                 self.lora_magnitude_vector[adapter].weight.data = \
-                    self.lora_magnitude_vector[adapter].weight.data.to(self.base_layer.weight.device)
+                    self.lora_magnitude_vector[adapter].weight.data.to(device)
 
         return self.unmerge_origin()
 
