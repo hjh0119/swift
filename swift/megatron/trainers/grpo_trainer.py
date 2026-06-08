@@ -24,6 +24,11 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 from swift.dataset import RowPreprocessor
 from swift.infer_engine.protocol import RequestConfig, RolloutInferRequest, RolloutOutput
 from swift.megatron.arguments import MegatronArguments, MegatronRLHFArguments
+from swift.grpo.fipo import compute_fipo_influence
+from swift.grpo.loss import (compute_clipping_metrics, compute_entropy_mask, compute_importance_weights,
+                             compute_kl_divergence, compute_per_token_loss, compute_real_loss, reduce_loss)
+from swift.grpo.rollout_is import (apply_rollout_importance_sampling, compute_is_metrics, compute_off_policy_sequence_mask,
+                                   compute_offpolicy_metrics)
 from swift.megatron.utils import RouterReplayHelper, get_padding_to, set_router_replay_data
 from swift.rlhf_trainers.grpo_trainer import DataType
 from swift.rlhf_trainers.utils import (aggressive_empty_cache, detect_async_reward_indices, make_reward_weights, nanstd,
@@ -460,50 +465,10 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
 
     def _compute_fipo_influence(self, log_ratio: torch.Tensor, coef_1: torch.Tensor, advantages: torch.Tensor,
                                 completion_mask: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """Compute FIPO token-level influence weight from discounted Future-KL."""
-        future_kl_delta = log_ratio.masked_fill(~completion_mask, 0.0)
-
-        if self.args.delta is not None:
-            delta = torch.as_tensor(self.args.delta, dtype=log_ratio.dtype, device=log_ratio.device)
-            high_ratio_mask = coef_1 > delta
-            future_kl_delta = torch.where(high_ratio_mask, torch.zeros_like(future_kl_delta), future_kl_delta)
-
-        seq_len = future_kl_delta.shape[1]
-        future_kl = torch.zeros_like(future_kl_delta)
-        positions = torch.arange(seq_len, device=log_ratio.device).unsqueeze(1)
-        gamma = torch.as_tensor(self.fipo_gamma, dtype=log_ratio.dtype, device=log_ratio.device)
-        chunk_size = 128
-        for chunk_start in range(0, seq_len, chunk_size):
-            chunk_end = min(seq_len, chunk_start + chunk_size)
-            chunk_positions = torch.arange(chunk_start, chunk_end, device=log_ratio.device).unsqueeze(0)
-            distance = chunk_positions - positions
-            future_mask = distance >= 0
-            decay_block = torch.pow(gamma, distance.clamp(min=0)) * future_mask.to(log_ratio.dtype)
-            future_kl += torch.matmul(future_kl_delta[:, chunk_start:chunk_end], decay_block.t())
-        future_kl = future_kl.masked_fill(~completion_mask, 0.0)
-
-        influence_weight = torch.exp(future_kl)
-
-        if self.fipo_clip_range:
-            high = 1 + self.fipo_clip_range
-            low = 1.0 if self.fipo_clip_high_only else 1 - self.fipo_clip_range
-            influence_weight = torch.clamp(influence_weight, min=low, max=high)
-        influence_weight = influence_weight.detach()
-
-        safety_mask = torch.ones_like(completion_mask, dtype=torch.bool)
-        if self.fipo_safety_threshold is not None:
-            negative_advantage = advantages.unsqueeze(1) < 0
-            high_is_ratio = coef_1 > self.fipo_safety_threshold
-            safety_mask = ~(negative_advantage & high_is_ratio)
-            influence_weight = torch.where(safety_mask, influence_weight,
-                                           torch.clamp(influence_weight, min=0.8, max=1.0))
-
-        metrics = {
-            'future_kl': future_kl,
-            'influence_weight': influence_weight,
-            'safety_mask': safety_mask,
-        }
-        return influence_weight, metrics
+        return compute_fipo_influence(
+            log_ratio, coef_1, advantages, completion_mask, self.fipo_gamma,
+            delta=self.args.delta, clip_range=self.fipo_clip_range,
+            clip_high_only=self.fipo_clip_high_only, safety_threshold=self.fipo_safety_threshold)
 
     @profiling_decorator
     def _generate_completions(self, batch):
@@ -1279,64 +1244,25 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             truncated_mask_expanded = truncated_mask.unsqueeze(-1).expand_as(completion_mask)
             completion_mask = completion_mask & (~truncated_mask_expanded)
 
-        # Compute KL divergence if needed
-        # Only compute KL for loss if kl_in_reward=False (GRPO style)
-        # When kl_in_reward=True, KL penalty is already applied to rewards in _compute_advantages
+        per_token_kl = None
         if self.beta != 0.0 and ref_per_token_logps is not None and not self.kl_in_reward:
-            safe_ratio = torch.clamp(ref_per_token_logps - per_token_logps, min=-20, max=20)
-            per_token_kl = torch.clamp(torch.exp(safe_ratio) - safe_ratio - 1, min=-10, max=10)
-        else:
-            per_token_kl = None
+            per_token_kl = compute_kl_divergence(ref_per_token_logps, per_token_logps)
 
-        # Compute log ratio for importance sampling
-        log_ratio = per_token_logps - old_per_token_logps
-
-        # Compute importance weights based on level
-        if self.importance_sampling_level == 'token':
-            log_importance_weights = log_ratio
-        elif self.importance_sampling_level in ['sequence', 'sequence_token']:
-            # Sequence-level: compute mean log ratio per sequence
-            seq_level_log_weights = ((log_ratio * completion_mask).sum(-1)
-                                     / completion_mask.sum(-1).clamp(min=1.0)).unsqueeze(-1)
-            if self.importance_sampling_level == 'sequence':
-                log_importance_weights = seq_level_log_weights
-            else:
-                seq_level_log_weight = seq_level_log_weights.detach()
-                log_importance_weights = per_token_logps - per_token_logps.detach() + seq_level_log_weight
-        else:
-            raise ValueError(
-                f"Unknown importance sampling level: {self.importance_sampling_level}. Possible values are 'token' "
-                ",'sequence' and 'sequence_token'.")
-
-        coef_1 = torch.exp(log_importance_weights)
+        coef_1, log_ratio = compute_importance_weights(
+            per_token_logps, old_per_token_logps, completion_mask, self.importance_sampling_level)
 
         fipo_metrics = None
-        if self.loss_type == 'cispo':
-            clamped_ratios = torch.clamp(coef_1, max=self.epsilon_high).detach()
-            per_token_loss = -clamped_ratios * advantages.unsqueeze(1) * per_token_logps
-        elif self.loss_type == 'sapo':
-            gate_pos = torch.sigmoid(self.tau_pos * (coef_1 - 1)) * (4.0 / self.tau_pos)
-            gate_neg = torch.sigmoid(self.tau_neg * (coef_1 - 1)) * (4.0 / self.tau_neg)
-            is_positive = advantages.unsqueeze(1) > 0
-            soft_gate = torch.where(is_positive, gate_pos, gate_neg)
-            per_token_loss = -soft_gate * advantages.unsqueeze(1)
-        elif self.loss_type in ['grpo', 'bnpo', 'dr_grpo', 'dapo', 'fipo']:
-            if self.loss_type == 'fipo':
-                fipo_weight, fipo_metrics = self._compute_fipo_influence(log_ratio, coef_1, advantages, completion_mask)
-
-            coef_2 = torch.clamp(coef_1, 1 - self.epsilon_low, 1 + self.epsilon_high)
-            if self.args.delta is not None:
-                coef_1 = torch.clamp(coef_1, max=self.args.delta)
-
-            per_token_loss1 = coef_1 * advantages.unsqueeze(1)
-            per_token_loss2 = coef_2 * advantages.unsqueeze(1)
-            per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
-            if self.loss_type == 'fipo':
-                per_token_loss = per_token_loss * fipo_weight
-        elif self.loss_type == 'real':
+        if self.loss_type == 'real':
             per_token_loss = torch.zeros_like(per_token_logps)
         else:
-            raise ValueError(f'Unknown loss type: {self.loss_type}')
+            fipo_weight = None
+            if self.loss_type == 'fipo':
+                fipo_weight, fipo_metrics = self._compute_fipo_influence(log_ratio, coef_1, advantages, completion_mask)
+            per_token_loss = compute_per_token_loss(
+                self.loss_type, coef_1, advantages, per_token_logps,
+                epsilon_low=self.epsilon_low, epsilon_high=self.epsilon_high,
+                delta=self.args.delta, tau_pos=self.tau_pos, tau_neg=self.tau_neg,
+                fipo_weight=fipo_weight)
 
         # Compute and apply entropy mask if enabled
         # entropy_mask zeros out gradients for low-entropy (confident) tokens
@@ -1363,14 +1289,9 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                         float('nan'), device=global_entropies_mean.device),
                 }
 
-            # Compute entropy threshold and mask for top_entropy_quantile
-            if self.top_entropy_quantile < 1.0:
-                # Compute threshold across all completion tokens in the batch
-                entropy_threshold = torch.nanquantile(entropies.flatten().float(), 1 - self.top_entropy_quantile)
-                entropy_metrics['entropy_threshold'] = entropy_threshold
-                # Only keep tokens with entropy >= threshold (high uncertainty tokens)
-                entropy_mask = entropies >= entropy_threshold
-                # Apply entropy mask to per_token_loss
+            entropy_mask, entropy_threshold = compute_entropy_mask(entropies, completion_mask, self.top_entropy_quantile)
+            if entropy_threshold is not None:
+                entropy_metrics['entropy_threshold'] = torch.tensor(entropy_threshold, device=per_token_loss.device)
                 per_token_loss = per_token_loss * entropy_mask
 
         # Add KL penalty if needed
@@ -1392,54 +1313,16 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
             off_policy_seq_mask_expanded = off_policy_seq_mask.unsqueeze(-1).expand_as(completion_mask)
             completion_mask = completion_mask & off_policy_seq_mask_expanded
 
-        if self.loss_type in ['grpo', 'sapo']:
-            # Per-sample mean, then batch mean
-            loss = ((per_token_loss * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)).mean()
-        elif self.loss_type == 'bnpo':
-            loss = (per_token_loss * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
-        elif self.loss_type == 'dr_grpo':
-            loss = (per_token_loss * completion_mask).sum() / (micro_batch_size * self.max_completion_length)
-        elif self.loss_type in ['cispo', 'dapo', 'fipo']:
-            # CISPO, DAPO, and FIPO: Normalize by total completion tokens across all processes
-            num_items_in_batch = data['num_items_in_batch']
-            dp_size = mpu.get_data_parallel_world_size()
-            normalizer = num_items_in_batch / dp_size
-            loss = (per_token_loss * completion_mask).sum() / normalizer.clamp(min=1.0)
-        elif self.loss_type == 'real':
-            global_scores = (log_ratio * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)
-
-            group_scores = global_scores.view(-1, self.num_generations)
-            group_rewards = advantages.view(-1, self.num_generations)
-
-            pos_mask = (group_rewards > 0)
-            neg_mask = (group_rewards <= 0)
-            valid_mask = (pos_mask.sum(dim=1) != 0) & (neg_mask.sum(dim=1) != 0)
-
-            if not valid_mask.any():
-                loss = torch.tensor(0., device=global_scores.device) * global_scores.mean()
-            else:
-                batch_scores = group_scores[valid_mask]
-                batch_pos_mask = pos_mask[valid_mask]
-                batch_neg_mask = neg_mask[valid_mask]
-
-                scaled_scores = batch_scores / self.real_tau
-                zeros = torch.zeros(batch_scores.size(0), 1, device=batch_scores.device, dtype=batch_scores.dtype)
-
-                # Negative Loss: log(1 + sum(e^{S_neg}))
-                neg_input = scaled_scores.masked_fill(~batch_neg_mask, float('-inf'))
-                neg_loss = torch.logsumexp(torch.cat([neg_input, zeros], dim=1), dim=1)
-
-                # Positive Loss: log(1 + sum(e^{-S_pos}))
-                pos_input = (-scaled_scores).masked_fill(~batch_pos_mask, float('-inf'))
-                pos_loss = torch.logsumexp(torch.cat([pos_input, zeros], dim=1), dim=1)
-
-                loss = (neg_loss + pos_loss).sum() / group_rewards.size(0)
-
-            if self.beta != 0.0 and per_token_kl is not None:
-                kl_loss = (per_token_kl * completion_mask).sum() / completion_mask.sum().clamp(min=1.0)
-                loss = loss + kl_loss * self.beta
+        if self.loss_type == 'real':
+            loss = compute_real_loss(
+                log_ratio, advantages, completion_mask, self.num_generations, self.real_tau,
+                per_token_kl=per_token_kl, beta=self.beta)
         else:
-            raise ValueError(f'Unknown loss type: {self.loss_type}')
+            loss = reduce_loss(
+                self.loss_type, per_token_loss, completion_mask,
+                batch_size=micro_batch_size, max_completion_length=self.max_completion_length,
+                num_items_in_batch=data.get('num_items_in_batch'),
+                dp_size=mpu.get_data_parallel_world_size())
 
         avg_metric = {
             'loss': loss.clone().detach(),
@@ -1827,259 +1710,27 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
 
         return batch
 
-    def _compute_sequence_level_ratios(self, is_ratio: torch.Tensor, completion_mask: torch.Tensor) -> torch.Tensor:
-        """
-        Helper function to compute sequence-level importance sampling ratios.
+    def _apply_rollout_importance_sampling(self, rollout_log_ratio, completion_mask):
+        return apply_rollout_importance_sampling(
+            rollout_log_ratio, completion_mask,
+            self.rollout_importance_sampling_mode, self.rollout_importance_sampling_threshold)
 
-        Args:
-            is_ratio: Token-level IS ratios, shape [batch_size, seq_len]
-            completion_mask: Boolean mask for completion tokens, shape [batch_size, seq_len]
+    def _compute_off_policy_sequence_mask(self, per_token_logps, old_policy_per_token_logps, completion_mask, advantages):
+        return compute_off_policy_sequence_mask(
+            per_token_logps, old_policy_per_token_logps, completion_mask, advantages,
+            self.off_policy_sequence_mask_delta)
 
-        Returns:
-            Sequence-level ratios as geometric mean of token-level ratios, shape [batch_size]
-        """
-        log_ratio = torch.log(is_ratio.clamp(min=1e-10))
-        # Compute per-sequence mean of log ratios
-        seq_log_ratios = (log_ratio * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)
-        seq_ratios = torch.exp(seq_log_ratios)
-        return seq_ratios
-
-    def _apply_rollout_importance_sampling(self, rollout_log_ratio: torch.Tensor,
-                                           completion_mask: torch.Tensor) -> torch.Tensor:
-        """
-        Apply rollout importance sampling correction using one of four modes.
-
-        Args:
-            rollout_log_ratio: log(π_θ / π_rollout) per token, shape [batch_size, seq_len]
-            completion_mask: Boolean mask for completion tokens, shape [batch_size, seq_len]
-
-        Returns:
-            IS weights to multiply with loss, same shape as rollout_log_ratio
-        """
-        mode = self.rollout_importance_sampling_mode
-        threshold = self.rollout_importance_sampling_threshold
-
-        # Clamp log_ratio to prevent numerical overflow from padding values
-        SAFETY_BOUND = 20.0
-        rollout_log_ratio_safe = torch.clamp(rollout_log_ratio, min=-SAFETY_BOUND, max=SAFETY_BOUND)
-
-        # Compute importance sampling ratios: exp(log_ratio)
-        is_ratio = torch.exp(rollout_log_ratio_safe)
-
-        if mode == 'token_truncate':
-            # Token-level truncated IS: clip ratios from above at threshold
-            is_weights = torch.clamp(is_ratio, max=threshold)
-
-        elif mode == 'token_mask':
-            # Token-level masked IS: mask out tokens with ratio > threshold
-            is_weights = torch.where(is_ratio <= threshold, is_ratio, torch.zeros_like(is_ratio))
-
-        elif mode == 'sequence_truncate':
-            # Sequence-level truncated IS: compute sequence-level ratio and clip
-            seq_ratios = self._compute_sequence_level_ratios(is_ratio, completion_mask)
-            clipped_seq_ratios = torch.clamp(seq_ratios, max=threshold)
-
-            # Expand back to token-level [batch_size] -> [batch_size, seq_len]
-            is_weights = clipped_seq_ratios.unsqueeze(-1).expand_as(is_ratio)
-
-        elif mode == 'sequence_mask':
-            # Sequence-level masked IS: mask entire sequences with ratio > threshold
-            seq_ratios = self._compute_sequence_level_ratios(is_ratio, completion_mask)
-            seq_mask = (seq_ratios <= threshold).float()
-
-            # Expand mask to token-level and apply to original token-level ratios
-            seq_mask_expanded = seq_mask.unsqueeze(-1).expand_as(is_ratio)
-            is_weights = is_ratio * seq_mask_expanded
-        else:
-            return is_ratio
-
-        return is_weights
-
-    def _compute_off_policy_sequence_mask(
-        self,
-        per_token_logps: torch.Tensor,
-        old_policy_per_token_logps: torch.Tensor,
-        completion_mask: torch.Tensor,
-        advantages: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Compute off-policy sequence mask to filter out sequences that deviate too much
-        from the old/rollout policy AND have negative advantage.
-
-        This implements the Off-Policy Sequence Masking technique from DeepSeek-V3.2
-        (https://arxiv.org/abs/2512.02556). The mask filters sequences where:
-        1. mean(old_policy_logps - policy_logps) > off_policy_sequence_mask_delta
-        2. AND advantage < 0
-
-        Args:
-            per_token_logps: Log probs from current policy, shape [batch_size, seq_len]
-            old_policy_per_token_logps: Log probs from old/rollout policy, shape [batch_size, seq_len].
-                Uses rollout_per_token_logps if available, otherwise old_per_token_logps.
-            completion_mask: Boolean mask for completion tokens, shape [batch_size, seq_len]
-            advantages: Advantage values per sample, shape [batch_size]
-
-        Returns:
-            Sequence mask, shape [batch_size], True = keep sequence, False = mask out
-        """
-        # Compute per-token log ratio: log(π_old / π_current)
-        # Following DeepSeek-V3.2: positive delta means old policy assigns higher prob
-        log_ratio = old_policy_per_token_logps - per_token_logps
-
-        # Compute sequence-level mean of log ratio
-        seq_mean_log_ratio = (log_ratio * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)
-
-        # Mask condition: delta > threshold AND advantage < 0
-        # Keep sequences that do NOT meet this condition
-        exceeds_threshold = seq_mean_log_ratio > self.off_policy_sequence_mask_delta
-        negative_advantage = advantages < 0
-        should_mask = exceeds_threshold & negative_advantage
-
-        # Return mask: True = keep, False = mask out
-        return ~should_mask
-
-    def _compute_rollout_offpolicy_metrics(
-        self,
-        per_token_logps: torch.Tensor,
-        rollout_per_token_logps: torch.Tensor,
-        completion_mask: torch.Tensor,
-    ) -> Dict[str, float]:
-        """
-        Compute off-policy diagnostic metrics (always computed for monitoring).
-
-        These metrics help diagnose the off-policy gap between rollout and training policies.
-
-        Args:
-            per_token_logps: Log probs from training policy model, shape [batch_size, seq_len]
-            rollout_per_token_logps: Log probs from rollout policy, shape [batch_size, seq_len]
-            completion_mask: Boolean mask for completion tokens, shape [batch_size, seq_len]
-
-        Returns:
-            Dictionary with off-policy diagnostic metrics
-        """
-        SAFETY_BOUND = 20.0
-        metrics = {}
+    def _compute_rollout_offpolicy_metrics(self, per_token_logps, rollout_per_token_logps, completion_mask):
         dp_group = mpu.get_data_parallel_group(with_context_parallel=True)
+        raw = compute_offpolicy_metrics(per_token_logps, rollout_per_token_logps, completion_mask)
+        return {k: gather(v.unsqueeze(0), group=dp_group).nanmean() for k, v in raw.items()}
 
-        # Helper function for masked mean
-        def masked_mean(x, mask, axis=None):
-            if axis is None:
-                return (x * mask).sum() / mask.sum().clamp(min=1.0)
-            else:
-                return (x * mask).sum(axis) / mask.sum(axis).clamp(min=1.0)
-
-        # 1. Training policy perplexity
-        # Compute per-sequence mean log prob
-        mean_log_prob_training = masked_mean(per_token_logps, completion_mask, axis=-1)  # [batch_size]
-        training_ppl = torch.exp(-mean_log_prob_training).mean()
-        gathered_training_ppl = gather(training_ppl.unsqueeze(0), group=dp_group)
-        metrics['training_ppl'] = gathered_training_ppl.nanmean()
-        metrics['training_log_ppl'] = gather((-mean_log_prob_training).mean().unsqueeze(0), group=dp_group).nanmean()
-
-        # 2. Compute rollout off-policy metrics
-        log_ratio = per_token_logps - rollout_per_token_logps
-        log_ratio = log_ratio * completion_mask
-
-        # 2a. kl: Direct estimator for KL(π_rollout || π_training)
-        kl = masked_mean(-log_ratio, completion_mask)
-        metrics['kl'] = gather(kl.unsqueeze(0), group=dp_group).nanmean()
-
-        # 2b. k3_kl: K3 estimator for KL
-        log_ratio_safe = torch.clamp(log_ratio, min=-20, max=20)
-        k3_kl_matrix = torch.clamp(torch.exp(log_ratio_safe) - log_ratio_safe - 1, min=-10, max=10)
-        k3_kl = masked_mean(k3_kl_matrix, completion_mask)
-        metrics['k3_kl'] = gather(k3_kl.unsqueeze(0), group=dp_group).nanmean()
-
-        # 2c. Rollout policy perplexity
-        mean_log_prob_rollout = masked_mean(rollout_per_token_logps, completion_mask, axis=-1)  # [batch_size]
-        rollout_ppl = torch.exp(-mean_log_prob_rollout).mean()
-        metrics['rollout_ppl'] = gather(rollout_ppl.unsqueeze(0), group=dp_group).nanmean()
-        metrics['rollout_log_ppl'] = gather((-mean_log_prob_rollout).mean().unsqueeze(0), group=dp_group).nanmean()
-
-        # 2d. Log PPL difference
-        log_ppl_diff = mean_log_prob_rollout - mean_log_prob_training
-        metrics['log_ppl_diff'] = gather(log_ppl_diff.mean().unsqueeze(0), group=dp_group).nanmean()
-        metrics['log_ppl_abs_diff'] = gather(log_ppl_diff.abs().mean().unsqueeze(0), group=dp_group).nanmean()
-        metrics['log_ppl_diff_max'] = gather(log_ppl_diff.max().unsqueeze(0), group=dp_group).max()
-        metrics['log_ppl_diff_min'] = gather(log_ppl_diff.min().unsqueeze(0), group=dp_group).min()
-
-        # 2e. PPL ratio
-        ppl_ratio = torch.exp(log_ppl_diff).mean()
-        metrics['ppl_ratio'] = gather(ppl_ratio.unsqueeze(0), group=dp_group).nanmean()
-
-        # 2f. Chi-squared divergence
-        log_ratio_safe = torch.clamp(log_ratio, min=-SAFETY_BOUND, max=SAFETY_BOUND)
-        rho_token = torch.exp(log_ratio_safe)
-        rho_squared_token = rho_token.square()
-        chi2_token = masked_mean(rho_squared_token, completion_mask) - 1.0
-        metrics['chi2_token'] = gather(chi2_token.unsqueeze(0), group=dp_group).nanmean()
-
-        # Sequence-level chi2
-        log_ratio_mean = masked_mean(log_ratio, completion_mask, axis=-1)  # [batch_size]
-        log_ratio_mean_safe = torch.clamp(log_ratio_mean, min=-SAFETY_BOUND, max=SAFETY_BOUND)
-        rho_geo = torch.exp(log_ratio_mean_safe)
-        chi2_seq = (rho_geo.square().mean() - 1.0)
-        metrics['chi2_seq'] = gather(chi2_seq.unsqueeze(0), group=dp_group).nanmean()
-
-        return metrics
-
-    def _compute_is_correction_metrics(
-        self,
-        rollout_log_ratio: torch.Tensor,
-        is_weights: torch.Tensor,
-        completion_mask: torch.Tensor,
-    ) -> Dict[str, float]:
-        """
-        Compute importance sampling correction metrics (ess, clipped_frac, is_weight_mean).
-        Only called when rollout_importance_sampling_mode is enabled.
-
-        Args:
-            rollout_log_ratio: Log ratio log(π_policy / π_rollout), shape [batch_size, seq_len]
-            is_weights: Importance sampling weights after correction, shape [batch_size, seq_len]
-            completion_mask: Boolean mask for completion tokens, shape [batch_size, seq_len]
-
-        Returns:
-            Dictionary with IS-specific metrics
-        """
-        metrics = {}
-        SAFETY_BOUND = 20.0
-        threshold = self.rollout_importance_sampling_threshold
-        threshold_lower = 1.0 / threshold
+    def _compute_is_correction_metrics(self, rollout_log_ratio, is_weights, completion_mask):
         dp_group = mpu.get_data_parallel_group(with_context_parallel=True)
-
-        # Helper function for masked mean
-        def masked_mean(x, mask):
-            return (x * mask).sum() / mask.sum().clamp(min=1.0)
-
-        # Compute IS ratio with safety bounds
-        log_ratio_safe = torch.clamp(rollout_log_ratio, min=-SAFETY_BOUND, max=SAFETY_BOUND)
-        is_ratio = torch.exp(log_ratio_safe)
-
-        # 1. IS weight statistics
-        mean_is_weight = masked_mean(is_weights, completion_mask)
-        metrics['is_weight_mean'] = gather(mean_is_weight.unsqueeze(0), group=dp_group).nanmean()
-
-        # 2. Compute Effective Sample Size (ESS) for IS weights
-        weights_for_ess = is_weights.clamp(min=threshold_lower, max=threshold)
-        mean_for_ess = masked_mean(weights_for_ess, completion_mask)
-        is_weights_normalized = weights_for_ess / (mean_for_ess + 1e-8)
-        ess = 1.0 / masked_mean(is_weights_normalized.square(), completion_mask).clamp(min=1e-10)
-        metrics['ess'] = gather(ess.unsqueeze(0), group=dp_group).nanmean()
-
-        # 3. Fraction of clipped/masked samples
-        if self.rollout_importance_sampling_mode in ['token_truncate', 'token_mask']:
-            # Token-level
-            if self.rollout_importance_sampling_mode == 'token_truncate':
-                clipped_frac = masked_mean((is_ratio > threshold).float(), completion_mask)
-            else:  # token_mask
-                clipped_frac = masked_mean((is_weights == 0).float(), completion_mask)
-            metrics['clipped_frac'] = gather(clipped_frac.unsqueeze(0), group=dp_group).nanmean()
-        else:
-            # Sequence-level (both truncate and mask)
-            seq_ratios = self._compute_sequence_level_ratios(is_ratio, completion_mask)
-            clipped_frac = (seq_ratios > threshold).float().mean()
-            metrics['clipped_frac'] = gather(clipped_frac.unsqueeze(0), group=dp_group).nanmean()
-
-        return metrics
+        raw = compute_is_metrics(
+            rollout_log_ratio, is_weights, completion_mask,
+            self.rollout_importance_sampling_mode, self.rollout_importance_sampling_threshold)
+        return {k: gather(v.unsqueeze(0), group=dp_group).nanmean() for k, v in raw.items()}
 
     def _prepare_model_inputs(self, inputs: 'DataType') -> Dict[str, Any]:
         """Filters inputs to create model_inputs, removing GRPO-specific and template extra keys."""
