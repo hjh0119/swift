@@ -111,7 +111,7 @@ def score_with_gym(
     Returns:
         ``[N, n_funcs + (1 if use_gym_env)]``.
     """
-    completions = [inp['messages'][-1]['content'] for inp in inputs]
+    completions = compute_kwargs.pop('completions', None) or [inp['messages'][-1]['content'] for inp in inputs]
 
     if use_gym_env:
         gym_reward = torch.tensor(
