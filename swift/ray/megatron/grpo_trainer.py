@@ -11,7 +11,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from swift.dataset import RowPreprocessor
 from swift.infer_engine.protocol import RolloutInferRequest, RolloutOutput
-from swift.rlhf_trainers.utils import compute_grpo_advantages, make_reward_weights, resolve_reward_funcs
+from swift.grpo.advantage import compute_advantages as compute_grpo_advantages
+from swift.rlhf_trainers.utils import make_reward_weights, resolve_reward_funcs
 from swift.rollout import MultiTurnScheduler, invoke_async_hook, multi_turns, run_multi_turn
 from swift.utils import get_logger
 from .base_trainer import BaseRayTrainer
