@@ -12,7 +12,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from swift.dataset import RowPreprocessor
 from swift.infer_engine.protocol import RolloutInferRequest, RolloutOutput
 from swift.grpo.advantage import compute_advantages as compute_grpo_advantages
-from swift.rlhf_trainers.utils import make_reward_weights, resolve_reward_funcs
+from swift.rlhf_trainers.utils import (get_non_thinking_prefix_ids, make_reward_weights,
+                                       replace_assistant_response_with_ids, resolve_reward_funcs)
 from swift.rollout import MultiTurnScheduler, invoke_async_hook, multi_turns, run_multi_turn
 from swift.utils import get_logger
 from .base_trainer import BaseRayTrainer
@@ -498,8 +499,7 @@ class GRPOTrainer(BaseRayTrainer):
         rollout_batch: Sequence[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
         """Encode rollout samples and keep them as per-sample payloads."""
-        from swift.rlhf_trainers.utils import replace_assistant_response_with_ids
-
+        non_thinking_prefix_ids = get_non_thinking_prefix_ids(self.template)
         rollout_for_encode: List[Dict[str, Any]] = []
         for data in rollout_batch:
             item = dict(data)
@@ -509,8 +509,11 @@ class GRPOTrainer(BaseRayTrainer):
                 loss_mask = None
                 if 'response_loss_mask' in item and item['response_loss_mask']:
                     loss_mask = item['response_loss_mask']
-                item['messages'] = replace_assistant_response_with_ids(item['messages'], item['response_token_ids'],
-                                                                       loss_mask)
+                item['messages'] = replace_assistant_response_with_ids(
+                    item['messages'],
+                    item['response_token_ids'],
+                    loss_mask,
+                    non_thinking_prefix_ids=non_thinking_prefix_ids)
             rollout_for_encode.append(item)
 
         encoded_list, error_list = self._batch_encode_parallel(rollout_for_encode, strict=True)

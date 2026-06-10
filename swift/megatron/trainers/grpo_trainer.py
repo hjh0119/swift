@@ -31,9 +31,9 @@ from swift.grpo.rollout_is import (apply_rollout_importance_sampling, compute_is
                                    compute_offpolicy_metrics)
 from swift.megatron.utils import RouterReplayHelper, get_padding_to, set_router_replay_data
 from swift.rlhf_trainers.grpo_trainer import DataType
-from swift.rlhf_trainers.utils import (aggressive_empty_cache, detect_async_reward_indices, make_reward_weights, nanstd,
-                                       pad_logps_back_to_batch, profiling_context, profiling_decorator,
-                                       replace_assistant_response_with_ids, resolve_reward_funcs,
+from swift.rlhf_trainers.utils import (aggressive_empty_cache, detect_async_reward_indices, get_non_thinking_prefix_ids,
+                                       make_reward_weights, nanstd, pad_logps_back_to_batch, profiling_context,
+                                       profiling_decorator, replace_assistant_response_with_ids, resolve_reward_funcs,
                                        set_expandable_segments)
 from swift.rollout import MultiTurnScheduler, multi_turns
 from swift.template import Template, TemplateInputs
@@ -1090,6 +1090,7 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
 
     def _maybe_replace_response_token(self, batch):
         # maybe replace the response token with the response token ids to avoid repetitive tokenize
+        non_thinking_prefix_ids = get_non_thinking_prefix_ids(self.template)
 
         for data in batch:
             if 'response_token_ids' in data and data['response_token_ids']:
@@ -1097,8 +1098,11 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                 if 'response_loss_mask' in data and data['response_loss_mask']:
                     loss_mask = data['response_loss_mask']
                 # token in token out
-                data['messages'] = replace_assistant_response_with_ids(data['messages'], data['response_token_ids'],
-                                                                       loss_mask)
+                data['messages'] = replace_assistant_response_with_ids(
+                    data['messages'],
+                    data['response_token_ids'],
+                    loss_mask,
+                    non_thinking_prefix_ids=non_thinking_prefix_ids)
         return batch
 
     @property
