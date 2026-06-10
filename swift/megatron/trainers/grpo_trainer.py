@@ -798,161 +798,38 @@ class MegatronGRPOTrainer(MegatronRolloutMixin, MegatronRLHFTrainer):
                             batch: DataType,
                             rewards_per_func: torch.Tensor,
                             kl_values: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        Compute advantages for RL training.
-
-        Supports different advantage estimators:
-        - 'grpo': Group mean baseline
-        - 'rloo': Leave-One-Out baseline
-        - 'reinforce_plus_plus': Similar to grpo but normalizes advantages std
-
-        Args:
-            batch: Local batch data samples
-            rewards_per_func: Reward per function for local data samples
-            kl_values: Optional KL values for kl_in_reward mode, shape [total_samples]
-
-        Returns:
-            advantages: Computed advantages for local batch, shape [local_batch_size]
-        """
-
-        def normalize_advantages(advantages: torch.Tensor, std_values: torch.Tensor) -> torch.Tensor:
-            """Normalize advantages if configured; otherwise, return as-is."""
-            if self.scale_rewards != 'none':
-                return advantages / (std_values + 1e-4)
-            return advantages
+        from swift.grpo.advantage import compute_advantages, compute_reward_metrics
 
         mode = 'train' if self.unwrapped_models[0].training else 'eval'
         assert len(batch) == rewards_per_func.shape[0]
         total_rewards_per_func = gather(rewards_per_func)
-        # NOTE: In GDPO mode, this weighted sum is only used for logging metrics.
-        # GDPO advantages are computed separately in the scale_rewards=='gdpo' branch below.
-        rewards = (total_rewards_per_func * self.reward_weights.unsqueeze(0)).nansum(dim=1)
+        num_generations = self.num_generations if mode == 'train' else self.num_generations_eval
 
-        # Apply KL penalty to rewards if kl_in_reward is enabled
         if self.kl_in_reward and self.beta != 0.0 and kl_values is not None:
             self._metrics[mode]['kl'].append(kl_values.nanmean().item())
-            rewards = rewards - self.beta * kl_values
 
-        # Use num_generations_eval in eval mode
-        num_generations = self.num_generations if mode == 'train' else self.num_generations_eval
-        grouped_rewards = rewards.view(-1, num_generations)
-        K = num_generations
+        advantages, rewards = compute_advantages(
+            total_rewards_per_func, self.reward_weights, num_generations,
+            advantage_estimator=self.advantage_estimator, scale_rewards=self.scale_rewards,
+            kl_in_reward=self.kl_in_reward, beta=self.beta, kl_values=kl_values)
 
-        # Compute group statistics
-        group_rewards_mean = grouped_rewards.mean(dim=1)
+        rm = compute_reward_metrics(rewards, total_rewards_per_func, self.reward_func_names, num_generations,
+                                    self.scale_rewards)
+        self._metrics[mode]['reward'].append(rm.reward_mean)
+        self._metrics[mode]['reward_std'].append(rm.reward_std)
+        self._metrics[mode]['frac_reward_zero_std'].append(rm.frac_reward_zero_std)
+        for name, val in rm.per_func_mean.items():
+            self._metrics[mode][f'rewards/{name}/mean'].append(val)
+        for name, val in rm.per_func_std.items():
+            self._metrics[mode][f'rewards/{name}/std'].append(val)
 
-        # Broadcast stats back to the original shape
-        group_rewards_mean = group_rewards_mean.repeat_interleave(K)
-
-        # Compute advantages based on estimation type
-        if self.advantage_estimator == 'rloo':
-            # RLOO: Leave-One-Out baseline
-            # A_i = r_i - mean(r_j for j != i)
-            # = r_i * K/(K-1) - mean_all * K/(K-1)
-            # Edge case: when K=1 (e.g., num_generations_eval=1), fall back to simple advantage
-            if K > 1:
-                advantages = rewards * K / (K - 1) - group_rewards_mean * K / (K - 1)
-            else:
-                advantages = rewards - group_rewards_mean
-        else:  # 'grpo' or 'reinforce_plus_plus'
-            # Both use group mean as baseline
-            advantages = rewards - group_rewards_mean
-
-        # Normalize advantages based on estimator and scale_rewards
-        if self.advantage_estimator == 'reinforce_plus_plus':
-            # REINFORCE++: Use std of advantages (not rewards)
-            if self.scale_rewards == 'batch':
-                # Global whitening: std computed on advantages
-                if advantages.numel() > 1:
-                    advantages_std = advantages.std().expand_as(advantages)
-                else:  # edge case: num_generations_eval=batch_size=1
-                    advantages_std = torch.zeros_like(advantages)
-            elif self.scale_rewards == 'group':
-                # Group-level whitening on advantages
-                advantages_grouped = advantages.view(-1, K)
-                if K > 1:
-                    advantages_std = advantages_grouped.std(dim=1).repeat_interleave(K)
-                else:  # edge case: num_generations_eval=1
-                    advantages_std = torch.zeros_like(advantages)
-            else:  # 'none'
-                advantages_std = None
-            if advantages_std is not None:
-                advantages = normalize_advantages(advantages, advantages_std)
-        else:  # 'grpo' or 'rloo'
-            # GRPO/RLOO: Use std of original rewards
-            if self.scale_rewards == 'batch':
-                # Global batch-level normalization
-                if rewards.numel() > 1:
-                    rewards_std = rewards.std().expand_as(rewards)
-                else:  # edge case: num_generations_eval=batch_size=1
-                    rewards_std = torch.zeros_like(rewards)
-            elif self.scale_rewards == 'group':
-                # Group-level normalization (default)
-                if K > 1:
-                    rewards_std = grouped_rewards.std(dim=1).repeat_interleave(K)
-                else:  # edge case: num_generations_eval=1
-                    rewards_std = torch.zeros_like(rewards)
-            elif self.scale_rewards == 'gdpo':
-                num_reward_funcs = total_rewards_per_func.shape[1]
-                normalized_advantages_list = []
-                for i in range(num_reward_funcs):
-                    reward_i = total_rewards_per_func[:, i]
-                    grouped_reward_i = reward_i.view(-1, K)
-                    group_mean = grouped_reward_i.mean(dim=1, keepdim=True)
-                    group_std = grouped_reward_i.std(dim=1, keepdim=True) + 1e-8
-                    normalized_i = (grouped_reward_i - group_mean) / group_std
-                    normalized_i = normalized_i.view(-1)
-                    normalized_advantages_list.append(self.reward_weights[i] * normalized_i)
-                summed_advantages = sum(normalized_advantages_list)
-                batch_mean = summed_advantages.mean()
-                batch_std = summed_advantages.std() + 1e-8
-                advantages = (summed_advantages - batch_mean) / batch_std
-                rewards_std = None
-            else:  # 'none'
-                rewards_std = None
-            if rewards_std is not None:
-                advantages = normalize_advantages(advantages, rewards_std)
-
-        def log_rewards_metrics(rewards: torch.Tensor, rewards_per_func_for_metrics: torch.Tensor):
-            """Log reward statistics for monitoring. Only log once per unique request_id."""
-            # rewards: [prompt_batch_size, num_generations]
-            # rewards_per_func_for_metrics: [prompt_batch_size*num_generations, self.num_reward_funcs]
-            group_rewards = rewards.view(-1, num_generations)
-            rewards_mean = group_rewards.mean(-1).mean().item()
-            # Compute std based on scale_rewards setting for logging
-            if self.scale_rewards in ['group', 'none', 'gdpo']:
-                # Handle edge case when num_generations_eval=1
-                if num_generations > 1:
-                    rewards_std = group_rewards.std(-1).mean().item()
-                else:
-                    rewards_std = 0.0
-            elif self.scale_rewards == 'batch':
-                rewards_std = rewards.std().item() if rewards.numel() > 1 else 0.0
-            if num_generations > 1:
-                is_std_zero = torch.isclose(group_rewards.std(dim=1), torch.zeros_like(group_rewards.std(dim=1)))
-            else:
-                is_std_zero = torch.ones(group_rewards.size(0), dtype=torch.bool, device=group_rewards.device)
-
-            self._metrics[mode]['reward'].append(rewards_mean)
-            self._metrics[mode]['reward_std'].append(rewards_std)
-            self._metrics[mode]['frac_reward_zero_std'].append(is_std_zero.float().mean().item())
-
-            # Log per-reward-function statistics using deduplicated rewards_per_func
-            for i, name in enumerate(self.reward_func_names):
-                col = rewards_per_func_for_metrics[:, i]
-                self._metrics[mode][f'rewards/{name}/mean'].append(torch.nanmean(col).item())
-                self._metrics[mode][f'rewards/{name}/std'].append(nanstd(col).item())
-
-        log_rewards_metrics(rewards=grouped_rewards, rewards_per_func_for_metrics=total_rewards_per_func)
         self._logs['advantages'].extend(advantages.tolist())
         for i, name in enumerate(self.reward_func_names):
             self._logs['rewards'][name].extend(total_rewards_per_func[:, i].tolist())
 
         slice_start = self.process_index * len(batch)
         slice_end = slice_start + len(batch)
-        advantages = advantages[slice_start:slice_end]
-
-        return advantages
+        return advantages[slice_start:slice_end]
 
     def _dynamic_sampling(self, rollout_batch: DataType,
                           rewards_per_func: torch.Tensor) -> Tuple[DataType, torch.Tensor]:

@@ -411,282 +411,53 @@ class GRPOTrainer(RolloutTrainerMixin, SwiftMixin, HFGRPOTrainer):
 
     def _compute_advantages(self, inputs: DataType, rewards_per_func: torch.Tensor,
                             batch_encoded_inputs: List[DataType]) -> torch.Tensor:
-        """
-        Compute advantages for RL training.
+        from swift.grpo.advantage import compute_advantages, compute_advantages_dynamic, compute_reward_metrics
 
-        Supports two modes:
-        1. **Default grouped mode** (no prompt_ids / request_ids provided)
-        - Assumes rewards are grouped by prompt and each prompt has exactly
-            `self.num_generations` completions.
-        - Computes advantages relative to group mean.
-        2. **Request-aware mode** (multi-turn conversations, variable number of samples)
-        - Groups rewards by unique `request_id` and computes statistics per prompt.
-        - Handles dynamic sample sizes where multiple request_ids may share the same prompt.
+        mode = 'train' if self.model.training else 'eval'
+        num_generations = self.num_generations if mode == 'train' else self.num_generations_eval
 
-        Args:
-            inputs (DataType):
-                Input data samples.
-            rewards_per_func (torch.Tensor):
-                Reward values for each reward function, shape `(N, num_reward_funcs)`.
-
-        Returns:
-            **advantages** (torch.Tensor):
-                Computed advantages, shape `(N,)`.
-        """
-
-        def normalize_advantages(advantages: torch.Tensor, rewards_std: torch.Tensor) -> torch.Tensor:
-            """Normalize advantages if configured; otherwise, return as-is."""
-            if self.scale_rewards != 'none':
-                return advantages / (rewards_std + 1e-4)
-            return advantages
-
-        def log_rewards_metrics(rewards: torch.Tensor, rewards_per_func_for_metrics: torch.Tensor):
-            """Log reward statistics for monitoring. Only log once per unique request_id."""
-            # rewards: [prompt_batch_size, num_generations]
-            # rewards_per_func_for_metrics: [prompt_batch_size*num_generations, self.num_reward_funcs]
-            mode = 'train' if self.model.training else 'eval'
-            num_generations = self.num_generations if mode == 'train' else self.num_generations_eval
-            group_rewards = rewards.view(-1, num_generations)
-            rewards_mean = group_rewards.mean(-1).mean().item()
-            if self.scale_rewards in ['group', 'none', 'gdpo']:
-                # Handle edge case when num_generations_eval=1
-                if num_generations > 1:
-                    rewards_std = group_rewards.std(-1).mean().item()
-                else:
-                    rewards_std = 0.0
-            elif self.scale_rewards == 'batch':
-                rewards_std = rewards.std().item() if rewards.numel() > 1 else 0.0
-            if num_generations > 1:
-                is_std_zero = torch.isclose(group_rewards.std(dim=1), torch.zeros_like(group_rewards.std(dim=1)))
-            else:
-                is_std_zero = torch.ones(group_rewards.size(0), dtype=torch.bool, device=group_rewards.device)
-
-            self._metrics[mode]['reward'].append(rewards_mean)
-            self._metrics[mode]['reward_std'].append(rewards_std)
-            self._metrics[mode]['frac_reward_zero_std'].append(is_std_zero.float().mean().item())
-
-            # Log per-reward-function statistics using deduplicated rewards_per_func
-            for i, name in enumerate(self.reward_func_names):
-                col = rewards_per_func_for_metrics[:, i]
-                self._metrics[mode][f'rewards/{name}/mean'].append(torch.nanmean(col).item())
-                self._metrics[mode][f'rewards/{name}/std'].append(nanstd(col).item())
-
-        def log_rewards_all(rewards_per_func: torch.Tensor):
-            """Log all rewards for debugging."""
-            for i, name in enumerate(self.reward_func_names):
-                self._logs['rewards'][name].extend(rewards_per_func[:, i].tolist())
-
-        # Step 0. Aggregate final reward using reward weights
-        device = self.accelerator.device
-        rewards = (rewards_per_func * self.reward_weights.unsqueeze(0)).nansum(dim=1)
-
+        # Compute KL values for kl_in_reward mode
+        kl_values = None
         if self.kl_in_reward and self.beta != 0.0:
             kl_list = []
             for batch_encoded in batch_encoded_inputs:
-                old_per_token_logps = batch_encoded['old_per_token_logps']
-                ref_per_token_logps = batch_encoded['ref_per_token_logps']
-                completion_mask = batch_encoded['completion_mask']
-                per_token_kl = old_per_token_logps - ref_per_token_logps
-                kl = (per_token_kl * completion_mask).sum(-1)
-                kl_list.append(kl)
+                per_token_kl = batch_encoded['old_per_token_logps'] - batch_encoded['ref_per_token_logps']
+                kl_list.append((per_token_kl * batch_encoded['completion_mask']).sum(-1))
+            kl_values = gather(torch.cat(kl_list, dim=0))
+            self._metrics[mode]['kl'].append(kl_values.nanmean().item())
 
-            kl = torch.cat(kl_list, dim=0)
-            kl = gather(kl)
-            mode = 'train' if self.model.training else 'eval'
-            self._metrics[mode]['kl'].append(kl.nanmean().item())
-            rewards = rewards - self.beta * kl
-
-        # --------------------------------------------------
-        # Case 1: Default grouped mode
-        # --------------------------------------------------
-        mode = 'train' if self.model.training else 'eval'
-        num_generations = self.num_generations if mode == 'train' else self.num_generations_eval
         if not self.dynamic_num_samples:
-            grouped_rewards = rewards.view(-1, num_generations)
-            K = num_generations
-
-            # Compute group statistics
-            group_rewards_mean = grouped_rewards.mean(dim=1)
-
-            # Broadcast stats back to the original shape
-            group_rewards_mean = group_rewards_mean.repeat_interleave(K)
-
-            # Compute advantages based on estimation type
-            if self.advantage_estimator == 'rloo':
-                # RLOO: Leave-One-Out baseline
-                # A_i = r_i - mean(r_j for j != i)
-                # = r_i * K/(K-1) - mean_all * K/(K-1)
-                # Edge case: when K=1 (e.g., num_generations_eval=1), fall back to simple advantage
-                if K > 1:
-                    advantages = rewards * K / (K - 1) - group_rewards_mean * K / (K - 1)
-                else:
-                    advantages = rewards - group_rewards_mean
-            else:  # 'grpo' or 'reinforce_plus_plus'
-                # Both use group mean as baseline
-                advantages = rewards - group_rewards_mean
-
-            # Normalize advantages based on estimator and scale_rewards
-            if self.advantage_estimator == 'reinforce_plus_plus':
-                # REINFORCE++: Use std of advantages (not rewards)
-                if self.scale_rewards == 'batch':
-                    # Global whitening: std computed on advantages
-                    # Note: advantages.mean() is mathematically 0, no need to subtract
-                    if advantages.numel() > 1:
-                        advantages_std = advantages.std().expand_as(advantages)
-                    else:  # edge case: num_generations_eval=batch_size=1
-                        advantages_std = torch.zeros_like(advantages)
-                elif self.scale_rewards == 'group':
-                    # Group-level whitening on advantages
-                    advantages_grouped = advantages.view(-1, K)
-                    if K > 1:
-                        advantages_std = advantages_grouped.std(dim=1).repeat_interleave(K)
-                    else:  # edge case: num_generations_eval=1
-                        advantages_std = torch.zeros_like(advantages)
-                else:  # 'none'
-                    advantages_std = None
-                if advantages_std is not None:
-                    advantages = normalize_advantages(advantages, advantages_std)
-            else:  # 'grpo' or 'rloo'
-                # GRPO/RLOO: Use std of original rewards
-                if self.scale_rewards == 'batch':
-                    if rewards.numel() > 1:
-                        rewards_std = rewards.std().expand_as(rewards)
-                    else:  # edge case: num_generations_eval=batch_size=1
-                        rewards_std = torch.zeros_like(rewards)
-                elif self.scale_rewards == 'group':
-                    if K > 1:
-                        rewards_std = grouped_rewards.std(dim=1).repeat_interleave(K)
-                    else:  # edge case: num_generations_eval=1
-                        rewards_std = torch.zeros_like(rewards)
-                elif self.scale_rewards == 'gdpo':
-                    grouped = rewards_per_func.view(-1, K, rewards_per_func.shape[1])
-                    group_mean = torch.nanmean(grouped, dim=1, keepdim=True)
-                    group_std = nanstd(grouped, dim=1, keepdim=True) if K > 1 else torch.zeros_like(group_mean)
-                    normalized = (grouped - group_mean) / (group_std + 1e-8)
-                    normalized = torch.nan_to_num(normalized, nan=0.0)
-                    normalized = normalized.view(-1, rewards_per_func.shape[1])
-                    advantages = (normalized * self.reward_weights.unsqueeze(0)).sum(dim=1)
-                    batch_std = advantages.std() + 1e-8
-                    advantages = (advantages - advantages.mean()) / batch_std
-                    rewards_std = None
-                else:  # 'none'
-                    rewards_std = None
-                if rewards_std is not None:
-                    advantages = normalize_advantages(advantages, rewards_std)
-
-            # Log metrics once per group
-            log_rewards_metrics(rewards=grouped_rewards, rewards_per_func_for_metrics=rewards_per_func)
-
-            # Log all rewards
-            log_rewards_all(rewards_per_func)
-
-            return advantages
-
-        # --------------------------------------------------
-        # Case 2: Request-aware mode
-        # --------------------------------------------------
+            advantages, rewards = compute_advantages(
+                rewards_per_func, self.reward_weights, num_generations,
+                advantage_estimator=self.advantage_estimator, scale_rewards=self.scale_rewards,
+                kl_in_reward=self.kl_in_reward, beta=self.beta, kl_values=kl_values)
+            metrics_rewards = rewards
+            metrics_rpf = rewards_per_func
         else:
             prompt_ids = gather_object([inp['prompt_id'] for inp in inputs])
             request_ids = gather_object([inp['request_id'] for inp in inputs])
-            assert rewards.shape[0] == len(prompt_ids) == len(request_ids)
-            device = self.accelerator.device
-
-            # Step 1. Deduplicate request_ids
+            advantages, rewards = compute_advantages_dynamic(
+                rewards_per_func, self.reward_weights, prompt_ids, request_ids,
+                advantage_estimator=self.advantage_estimator, scale_rewards=self.scale_rewards,
+                kl_in_reward=self.kl_in_reward, beta=self.beta, kl_values=kl_values)
             unique_indices = self._get_last_indices(request_ids)
-            unique_request_ids = [request_ids[i] for i in unique_indices.cpu()]
-            unique_prompt_ids = [prompt_ids[i] for i in unique_indices.cpu()]
+            metrics_rewards = rewards[unique_indices]
+            metrics_rpf = rewards_per_func[unique_indices]
 
-            # Step 2. Validate rewards consistency within the same request_id
-            for rid in set(request_ids):
-                idxs = [i for i, r in enumerate(request_ids) if r == rid]
-                if not torch.allclose(rewards[idxs], rewards[idxs[0]].expand(len(idxs)), atol=1e-6):
-                    raise ValueError(f'Inconsistent rewards detected for request_id={rid}.')
+        rm = compute_reward_metrics(metrics_rewards, metrics_rpf, self.reward_func_names, num_generations,
+                                    self.scale_rewards)
+        self._metrics[mode]['reward'].append(rm.reward_mean)
+        self._metrics[mode]['reward_std'].append(rm.reward_std)
+        self._metrics[mode]['frac_reward_zero_std'].append(rm.frac_reward_zero_std)
+        for name, val in rm.per_func_mean.items():
+            self._metrics[mode][f'rewards/{name}/mean'].append(val)
+        for name, val in rm.per_func_std.items():
+            self._metrics[mode][f'rewards/{name}/std'].append(val)
 
-            # Step 3. Group rewards by prompt_id and compute prompt-level mean/std
-            unique_rewards = rewards[unique_indices]
-            prompt_to_indices = {}
-            for idx, pid in enumerate(unique_prompt_ids):
-                prompt_to_indices.setdefault(pid, []).append(idx)
+        for i, name in enumerate(self.reward_func_names):
+            self._logs['rewards'][name].extend(rewards_per_func[:, i].tolist())
 
-            prompt_means = torch.zeros(len(unique_rewards), device=device)
-            for pid, idxs in prompt_to_indices.items():
-                idx_tensor = torch.tensor(idxs, device=device)
-                r_group = unique_rewards[idx_tensor]
-                prompt_means[idx_tensor] = r_group.mean()
-
-            # Step 4. Compute advantages
-            if self.advantage_estimator == 'rloo':
-                # RLOO: Leave-One-Out baseline for dynamic mode
-                request_advantages = torch.zeros_like(unique_rewards)
-                for pid, idxs in prompt_to_indices.items():
-                    K = len(idxs)
-                    idx_tensor = torch.tensor(idxs, device=device)
-                    r_group = unique_rewards[idx_tensor]
-                    # A_i = r_i * K/(K-1) - mean * K/(K-1)
-                    # Edge case: when K=1, fall back to simple advantage
-                    if K > 1:
-                        request_advantages[idx_tensor] = (r_group * K / (K - 1) - r_group.mean() * K / (K - 1))
-                    else:
-                        request_advantages[idx_tensor] = r_group - r_group.mean()
-            else:  # 'grpo' or 'reinforce_plus_plus'
-                # Both use group mean as baseline
-                request_advantages = unique_rewards - prompt_means
-
-            # Step 5. Normalize advantages
-            if self.advantage_estimator == 'reinforce_plus_plus':
-                # REINFORCE++: Use std of advantages (not rewards)
-                if self.scale_rewards == 'batch':
-                    # Global whitening: std computed on advantages
-                    # Note: advantages.mean() is mathematically 0, no need to subtract
-                    if request_advantages.numel() > 1:
-                        advantages_std = request_advantages.std()
-                    else:
-                        advantages_std = torch.tensor(0.0, device=device)
-                    prompt_stds = torch.full_like(request_advantages, advantages_std)
-                elif self.scale_rewards == 'group':
-                    # Group-level whitening on advantages
-                    prompt_stds = torch.zeros(len(unique_rewards), device=device)
-                    for pid, idxs in prompt_to_indices.items():
-                        idx_tensor = torch.tensor(idxs, device=device)
-                        adv_group = request_advantages[idx_tensor]
-                        # Edge case: when group size is 1
-                        prompt_stds[idx_tensor] = adv_group.std() if len(idxs) > 1 else 0.0
-                else:  # 'none'
-                    prompt_stds = None
-                if prompt_stds is not None:
-                    request_advantages = normalize_advantages(request_advantages, prompt_stds)
-            else:  # 'grpo' or 'rloo'
-                # GRPO/RLOO: Use std of original rewards
-                if self.scale_rewards == 'batch':
-                    if unique_rewards.numel() > 1:
-                        rewards_std = unique_rewards.std()
-                    else:
-                        rewards_std = torch.tensor(0.0, device=device)
-                    prompt_stds = torch.full_like(unique_rewards, rewards_std)
-                elif self.scale_rewards == 'group':
-                    prompt_stds = torch.zeros(len(unique_rewards), device=device)
-                    for pid, idxs in prompt_to_indices.items():
-                        idx_tensor = torch.tensor(idxs, device=device)
-                        r_group = unique_rewards[idx_tensor]
-                        # Edge case: when group size is 1
-                        prompt_stds[idx_tensor] = r_group.std() if len(idxs) > 1 else 0.0
-                else:  # 'none'
-                    prompt_stds = None
-                if prompt_stds is not None:
-                    request_advantages = normalize_advantages(request_advantages, prompt_stds)
-
-            # Map advantages back to original order
-            rid_to_idx = {rid: idx for idx, rid in enumerate(unique_request_ids)}
-            indices_in_unique = torch.tensor([rid_to_idx[r] for r in request_ids], device=device)
-            advantages = request_advantages[indices_in_unique]
-
-            # Step 5. Log metrics for unique request_ids
-            log_rewards_metrics(rewards=unique_rewards, rewards_per_func_for_metrics=rewards_per_func[unique_indices])
-
-            # Step 6. Log all rewards
-            log_rewards_all(rewards_per_func)
-
-            return advantages
+        return advantages
 
     @profiling_decorator
     def _dynamic_sampling(self, inputs, rewards_per_func):
