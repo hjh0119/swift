@@ -311,6 +311,146 @@ def load_audio(audio: Union[str, bytes], sampling_rate: int, return_sr: bool = F
     return res if return_sr else res[0]
 
 
+def _resample_audio_pyav(audio: np.ndarray, *, orig_sr: float, target_sr: float) -> np.ndarray:
+    import av
+    orig_sr_int = int(round(orig_sr))
+    target_sr_int = int(round(target_sr))
+    if orig_sr_int == target_sr_int:
+        return audio
+    if audio.ndim == 2:
+        return np.stack([_resample_audio_pyav(ch, orig_sr=orig_sr, target_sr=target_sr) for ch in audio], axis=0)
+    expected_len = int(math.ceil(audio.shape[-1] * target_sr_int / orig_sr_int))
+    min_samples = 1024
+    audio_f32 = np.asarray(audio, dtype=np.float32)
+    if len(audio_f32) < min_samples:
+        audio_f32 = np.pad(audio_f32, (0, min_samples - len(audio_f32)))
+    audio_f32 = audio_f32.reshape(1, -1)
+    resampler = av.AudioResampler(format='fltp', layout='mono', rate=target_sr_int)
+    frame = av.AudioFrame.from_ndarray(audio_f32, format='fltp', layout='mono')
+    frame.sample_rate = orig_sr_int
+    out_frames = resampler.resample(frame)
+    out_frames.extend(resampler.resample(None))
+    result = np.concatenate([f.to_ndarray() for f in out_frames], axis=1).squeeze(0)
+    return result[:expected_len]
+
+
+def load_audio_vllm(path: Union[str, bytes, BytesIO], *, sr: float, mono: bool = True):
+    """Load audio with the same logic as vLLM rollout (soundfile, then pyav fallback)."""
+    import av
+    import soundfile
+    bad_sf_codes = {0, 1, 3, 4}
+    if not isinstance(path, BytesIO):
+        path = load_file(path)
+
+    def _load_soundfile():
+        with soundfile.SoundFile(path) as f:
+            native_sr = f.samplerate
+            y = f.read(dtype='float32', always_2d=False).T
+        if mono and y.ndim > 1:
+            y = np.mean(y, axis=tuple(range(y.ndim - 1)))
+        if sr is not None and sr != native_sr:
+            y = _resample_audio_pyav(y, orig_sr=native_sr, target_sr=sr)
+            return y, int(sr)
+        return y, native_sr
+
+    def _load_pyav():
+        path.seek(0)
+        with av.open(path) as container:
+            if not container.streams.audio:
+                raise ValueError('No audio stream found.')
+            stream = container.streams.audio[0]
+            stream.thread_type = 'AUTO'
+            native_sr = stream.rate
+            target_sr = sr or native_sr
+            chunks = []
+            needs_resampling = not math.isclose(float(target_sr), float(native_sr), rel_tol=0.0, abs_tol=1e-6)
+            resampler = av.AudioResampler(format='fltp', layout='mono', rate=target_sr) if needs_resampling else None
+            for frame in container.decode(stream):
+                if needs_resampling:
+                    for out_frame in resampler.resample(frame):
+                        chunks.append(out_frame.to_ndarray())
+                else:
+                    chunks.append(frame.to_ndarray())
+        if not chunks:
+            raise ValueError('No audio found.')
+        y = np.concatenate(chunks, axis=-1).astype(np.float32)
+        if mono and y.ndim > 1:
+            y = np.mean(y, axis=0)
+        return y, target_sr
+
+    try:
+        return _load_soundfile()
+    except soundfile.LibsndfileError as exc:
+        if exc.code not in bad_sf_codes:
+            raise
+    path.seek(0)
+    return _load_pyav()
+
+
+def pad_audio_to_hop_length(x: np.ndarray, hop_length: int) -> np.ndarray:
+    length = x.shape[-1]
+    if length % hop_length != 0:
+        pad_length = hop_length - (length % hop_length)
+        x = np.pad(x, (0, pad_length), mode='constant', constant_values=0)
+    return x
+
+
+def _video_local_path(path: Union[str, bytes]) -> str:
+    if isinstance(path, str) and path.startswith('http'):
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as f:
+            f.write(load_file(path).read())
+            return f.name
+    checked = _check_path(path) if isinstance(path, str) else None
+    return checked or path
+
+
+def video_to_ndarrays(path: Union[str, bytes], num_frames: int = -1) -> np.ndarray:
+    import cv2
+    local_path = _video_local_path(path)
+    cap = cv2.VideoCapture(local_path)
+    if not cap.isOpened():
+        raise ValueError(f'Could not open video file {path}')
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    num_frames = num_frames if num_frames > 0 else total_frames
+    frame_indices = set(np.linspace(0, total_frames - 1, num_frames, dtype=int))
+    frames = []
+    for idx in range(total_frames):
+        if not cap.grab():
+            break
+        if idx in frame_indices:
+            ret, frame = cap.retrieve()
+            if ret:
+                frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    cap.release()
+    frames = np.stack(frames)
+    if len(frames) < num_frames:
+        raise ValueError(f'Could not read enough frames from video file {path}')
+    return frames
+
+
+def video_get_metadata(path: Union[str, bytes], num_frames: int = -1) -> dict:
+    import cv2
+    local_path = _video_local_path(path)
+    cap = cv2.VideoCapture(local_path)
+    if not cap.isOpened():
+        raise ValueError(f'Could not open video file {path}')
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    duration = total_frames / fps if fps > 0 else 0
+    cap.release()
+    if num_frames == -1 or num_frames > total_frames:
+        num_frames = total_frames
+    return {
+        'total_num_frames': num_frames,
+        'fps': duration / num_frames if num_frames else fps,
+        'duration': duration,
+        'video_backend': 'opencv',
+        'frames_indices': list(range(num_frames)),
+        'do_sample_frames': num_frames == total_frames,
+    }
+
+
 def load_video_valley(video: Union[str, bytes]):
     import decord
     from torchvision import transforms

@@ -18,7 +18,7 @@ from ..register import register_template
 from ..template_inputs import StdTemplateInputs
 from ..template_meta import TemplateMeta
 from ..utils import Context, Word, findall
-from ..vision_utils import load_audio, load_batch, load_video_ovis2, load_video_ovis2_5
+from ..vision_utils import load_audio, load_batch, load_audio_vllm, pad_audio_to_hop_length, load_video_ovis2, load_video_ovis2_5
 from .llama import Llama3TemplateMeta
 from .utils import DEFAULT_SYSTEM, ChatmlTemplateMeta
 
@@ -708,6 +708,27 @@ class Qwen2_5OmniTemplate(Qwen2_5VLTemplate):
         self.use_audio_in_video = get_env_args('use_audio_in_video', bool, False)
         self.sampling_rate = get_env_args('sampling_rate', int, self.processor.feature_extractor.sampling_rate)
 
+    def _load_audio_omni(self, audio, sampling_rate: int):
+        waveform, _ = load_audio_vllm(audio, sr=sampling_rate, mono=True)
+        return waveform
+
+    def _apply_omni_v3_audio_postprocess(self, media_inputs, audios, hop_length, truncation=False):
+        if not audios or 'feature_attention_mask' not in media_inputs:
+            return media_inputs
+        feature_extractor = self.processor.feature_extractor
+        audio_num_frames = []
+        for audio in audios:
+            audio_length = len(audio[0]) if isinstance(audio, tuple) else len(audio)
+            num_frame = (
+                (audio_length // hop_length) if audio_length % hop_length == 0 else (audio_length // hop_length - 1))
+            if truncation:
+                num_frame = min(num_frame, feature_extractor.n_samples // hop_length)
+            audio_num_frames.append(num_frame)
+        media_inputs['feature_attention_mask'] = torch.stack(
+            [torch.ones(num_frame, dtype=torch.int64) for num_frame in audio_num_frames])
+        media_inputs['audio_feature_lengths'] = torch.tensor(audio_num_frames, dtype=torch.int64)
+        return media_inputs
+
     def replace_tag(self, media_type: Literal['image', 'video', 'audio'], index: int,
                     inputs: StdTemplateInputs) -> List[Context]:
         from qwen_omni_utils import fetch_image, fetch_video
@@ -726,7 +747,10 @@ class Qwen2_5OmniTemplate(Qwen2_5VLTemplate):
                 return ['<|vision_start|><|image_pad|><|vision_end|>']
         elif media_type == 'audio':
             if self.mode != 'vllm':
-                inputs.audios[index] = load_audio(inputs.audios[index], sampling_rate)
+                if self.version == 'omni_v3':
+                    inputs.audios[index] = self._load_audio_omni(inputs.audios[index], sampling_rate)
+                else:
+                    inputs.audios[index] = load_audio(inputs.audios[index], sampling_rate)
             if self.version == 'omni_v2_5':
                 return ['<|audio_bos|><|AUDIO|><|audio_eos|>']
             elif self.version == 'omni_v3':
@@ -744,7 +768,10 @@ class Qwen2_5OmniTemplate(Qwen2_5VLTemplate):
             if self.use_audio_in_video:
                 if isinstance(video, list):  # image list
                     raise ValueError('image list as video input does not support use_audio_in_video')
-                audio = load_audio(video, sampling_rate)
+                if self.version == 'omni_v3':
+                    audio = self._load_audio_omni(video, sampling_rate)
+                else:
+                    audio = load_audio(video, sampling_rate)
                 if self.mode != 'vllm':
                     inputs.audios.insert(inputs.audio_idx, (audio, 'video'))
                 else:
@@ -825,6 +852,13 @@ class Qwen2_5OmniTemplate(Qwen2_5VLTemplate):
                 video_audios_mask.append(False)
         video_audios_mask = torch.tensor(video_audios_mask)
         do_resize = self.version == 'omni_v3'
+        if self.version == 'omni_v3' and inputs.audios:
+            hop_length = processor.feature_extractor.hop_length
+            inputs.audios = [
+                (pad_audio_to_hop_length(audio[0], hop_length), audio[1])
+                if isinstance(audio, tuple) else pad_audio_to_hop_length(audio, hop_length)
+                for audio in inputs.audios
+            ]
         media_inputs = processor(
             text='',
             audio=inputs.audios or None,
@@ -835,6 +869,10 @@ class Qwen2_5OmniTemplate(Qwen2_5VLTemplate):
         media_inputs.pop('input_ids')
         media_inputs.pop('attention_mask')
         media_inputs = to_float_dtype(media_inputs, self.model_info.torch_dtype)
+        if self.version == 'omni_v3' and inputs.audios:
+            hop_length = processor.feature_extractor.hop_length
+            media_inputs = self._apply_omni_v3_audio_postprocess(
+                media_inputs, inputs.audios, hop_length, truncation=False)
         input_ids = encoded['input_ids']
         labels = encoded['labels']
         loss_scale = encoded.get('loss_scale', None)
