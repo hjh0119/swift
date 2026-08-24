@@ -3,6 +3,8 @@ import torch
 import unittest
 from functools import lru_cache
 
+from swift.utils import use_hf_hub
+
 # NOTE: All tests here only load the processor (tokenizer + vision processor) and the
 # remote-code python files via `get_model_processor` (i.e. `load_model=False`), so
 # *.safetensors / *.bin weight shards are NOT downloaded (see `safe_snapshot_download`,
@@ -10,7 +12,9 @@ from functools import lru_cache
 # The template `encode`/official processor `__call__` paths are pure tokenization +
 # image/video preprocessing and never run a model forward, so no weights are required.
 
-MODEL = os.getenv('MOSS_VL_TEST_MODEL', 'OpenMOSS-Team/MOSS-VL-Instruct-0708')
+MODEL = 'openmoss/MOSS-VL-Instruct-0708'
+if use_hf_hub():
+    MODEL = 'OpenMOSS-Team/MOSS-VL-Instruct-0708'
 VIDEO = 'https://modelscope-open.oss-cn-hangzhou.aliyuncs.com/images/baby.mp4'
 
 
