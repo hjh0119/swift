@@ -711,7 +711,8 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
     torch_dtype: Optional[Union[torch.dtype, str]] = None
     rope_scaling: Optional[Union[dict, str]] = None
     apply_wd_to_qk_layernorm: bool = False
-    linear_decoupled_in_proj: bool = False
+    # None: keep the value parsed from the hf config by mcore-bridge
+    linear_decoupled_in_proj: Optional[bool] = None
 
     enable_dft_loss: bool = False
     enable_channel_loss: bool = False
@@ -828,8 +829,11 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
             if self.megatron_model_meta is None:
                 raise ValueError(f'Model: {self.model} is not supported.')
         self._init_teacher_model()
-        if self.apply_wd_to_qk_layernorm and self.model_type not in {'qwen3_next', 'qwen3_5', 'qwen3_5_moe'}:
-            raise ValueError('apply_wd_to_qk_layernorm is only supported for qwen3_next, qwen3_5 and qwen3_5_moe')
+        if self.apply_wd_to_qk_layernorm and self.model_type not in {
+                'qwen3_next', 'qwen3_5', 'qwen3_5_moe', 'qwen3_8_flash_next'
+        }:
+            raise ValueError('apply_wd_to_qk_layernorm is only supported for qwen3_next, qwen3_5, '
+                             'qwen3_5_moe and qwen3_8_flash_next')
         if self.pipeline_model_parallel_size == 1 and (self.decoder_first_pipeline_num_layers is not None
                                                        or self.decoder_last_pipeline_num_layers is not None):
             raise ValueError('pipeline_model_parallel_size must be greater than 1 if you want to set '

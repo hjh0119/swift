@@ -1561,6 +1561,277 @@ register_model(
         tags=['vision']))
 
 
+# ==================== Qwen-Air (qwen4_exp) ====================
+# The qwen4_exp module ships with the internal transformers (5.16.0.dev0 snapshot). On an older
+# installed transformers (e.g. 5.14.x) it imports fine except for a few utils added in 5.16;
+# `_compat_qwen4_exp_transformers` polyfills those (source copied verbatim from 5.16.0.dev0)
+# before importing the modeling file, then registers qwen4_exp with the Auto classes.
+_QWEN4_EXP_COMPAT_DONE = False
+
+
+def _compat_qwen4_exp_transformers() -> bool:
+    global _QWEN4_EXP_COMPAT_DONE
+    if _QWEN4_EXP_COMPAT_DONE:
+        return True
+    if importlib.util.find_spec('transformers.models.qwen4_exp') is None:
+        logger.warning('The `qwen4_exp` module is missing from the installed transformers. '
+                       'Copy `models/qwen4_exp` from the internal transformers repo into the installed '
+                       'transformers/models directory to enable the Qwen-Air (qwen4_exp) model type.')
+        return False
+
+    import transformers.integrations as hf_integrations
+    if not hasattr(hf_integrations, 'use_kernel_func_from_hub_with_fallback'):
+        # Only present in newer transformers; falls back to the in-file torch implementation.
+
+        def use_kernel_func_from_hub_with_fallback(func_name, package, internal_path=None):
+
+            def decorator(torch_function):
+                return torch_function
+
+            return decorator
+
+        hf_integrations.use_kernel_func_from_hub_with_fallback = use_kernel_func_from_hub_with_fallback
+
+    from transformers.utils import generic as hf_generic
+    if not hasattr(hf_generic, 'get_max_seqlen'):
+        from transformers.utils.generic import is_flash_attention_requested
+
+        def get_max_seqlen(cu_seqlens, config, kwargs=None, kwarg_name='max_seqlen'):
+            if kwargs is not None and (max_seqlen := kwargs.pop(kwarg_name, None)) is not None:
+                return max_seqlen
+            if not is_flash_attention_requested(config):
+                return None
+            return (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+
+        hf_generic.get_max_seqlen = get_max_seqlen
+
+    from transformers import vision_utils
+    if not hasattr(vision_utils, '_interpolation_axis_taps_weights'):
+
+        def _interpolation_axis_taps_weights(index, size, side, mode, align_corners, padding='border'):
+            index = index.to(torch.float32)
+            if align_corners:
+                src = index * (side - 1) / torch.clamp(size - 1, min=1)
+            else:
+                src = (index + 0.5) * side / size - 0.5
+            floor = torch.floor(src)
+            if mode == 'bilinear':
+                offsets = torch.arange(0, 2, device=index.device)
+            elif mode == 'bicubic':
+                offsets = torch.arange(-1, 3, device=index.device)
+            else:
+                raise ValueError(f"Unsupported interpolation mode {mode!r} (expected 'bilinear' or 'bicubic').")
+            raw_taps = floor.long()[:, None] + offsets
+            taps = raw_taps.clamp(0, side - 1)
+            distance = (src[:, None] - floor[:, None] - offsets).abs()
+            if mode == 'bilinear':
+                weights = (1 - distance).clamp(min=0)
+            else:
+                a = -0.75
+                near = ((a + 2) * distance - (a + 3)) * distance * distance + 1
+                far = ((a * distance - 5 * a) * distance + 8 * a) * distance - 4 * a
+                weights = torch.where(distance <= 1, near, far)
+            if padding == 'zeros':
+                weights = weights * ((raw_taps >= 0) & (raw_taps <= side - 1))
+            return taps, weights
+
+        vision_utils._interpolation_axis_taps_weights = _interpolation_axis_taps_weights
+
+    if not hasattr(vision_utils, 'get_vision_interpolation_indices_and_weights'):
+
+        def get_vision_interpolation_indices_and_weights(grid_thw,
+                                                         num_grid_per_side,
+                                                         mode='bilinear',
+                                                         align_corners=False,
+                                                         spatial_merge_size=1,
+                                                         padding='border',
+                                                         kwargs=None):
+            if kwargs is not None:
+                interp_indices = kwargs.pop('interp_indices', None)
+                interp_weights = kwargs.pop('interp_weights', None)
+                if interp_indices is not None and interp_weights is not None:
+                    return interp_indices, interp_weights
+            side = num_grid_per_side
+            merge = spatial_merge_size
+            device = grid_thw.device
+            counts = grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2]
+            heights = torch.repeat_interleave(grid_thw[:, 1], counts)
+            widths = torch.repeat_interleave(grid_thw[:, 2], counts)
+            starts = torch.repeat_interleave(F.pad(counts.cumsum(0)[:-1], (1, 0)), counts)
+            within = (torch.arange(counts.sum(), device=device) - starts) % (heights * widths)
+            blocks_w = widths // merge
+            in_col = within % merge
+            in_row = (within // merge) % merge
+            block_col = (within // (merge * merge)) % blocks_w
+            block_row = within // (merge * merge * blocks_w)
+            row = block_row * merge + in_row
+            col = block_col * merge + in_col
+            h_taps, h_weights = vision_utils._interpolation_axis_taps_weights(row, heights, side, mode, align_corners,
+                                                                              padding)
+            w_taps, w_weights = vision_utils._interpolation_axis_taps_weights(col, widths, side, mode, align_corners,
+                                                                              padding)
+            n = h_taps.shape[1]
+            indices = (h_taps[:, :, None] * side + w_taps[:, None, :]).reshape(-1, n * n)
+            weights = (h_weights[:, :, None] * w_weights[:, None, :]).reshape(-1, n * n)
+            return indices, weights
+
+        vision_utils.get_vision_interpolation_indices_and_weights = get_vision_interpolation_indices_and_weights
+
+    if 'merge_temporal' not in inspect.signature(vision_utils.get_vision_cu_seqlens).parameters:
+        # `merge_temporal` was added in a newer transformers; the installed
+        # version only implements the per-frame (merge_temporal=False) branch.
+        orig_get_vision_cu_seqlens = vision_utils.get_vision_cu_seqlens
+
+        def get_vision_cu_seqlens(grid_thw, merge_temporal=False, kwargs=None):
+            if not merge_temporal:
+                return orig_get_vision_cu_seqlens(grid_thw, kwargs=kwargs)
+            if kwargs is not None and (cu_seqlens := kwargs.pop('cu_seqlens', None)) is not None:
+                return cu_seqlens
+            # merge_temporal=True: the whole clip is one attention segment.
+            dtype = grid_thw.dtype if torch.jit.is_tracing() else torch.int32
+            seqlens = grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2]
+            return F.pad(seqlens.cumsum(dim=0, dtype=dtype), (1, 0), value=0)
+
+        vision_utils.get_vision_cu_seqlens = get_vision_cu_seqlens
+
+    if not hasattr(vision_utils, 'get_vision_attention_seqlens'):
+
+        def get_vision_attention_seqlens(grid_thw, config, merge_temporal=False, kwargs=None):
+            cu_seqlens = vision_utils.get_vision_cu_seqlens(grid_thw, merge_temporal=merge_temporal, kwargs=kwargs)
+            max_seqlen = hf_generic.get_max_seqlen(cu_seqlens, config, kwargs=kwargs)
+            return cu_seqlens, max_seqlen
+
+        vision_utils.get_vision_attention_seqlens = get_vision_attention_seqlens
+
+    # `allow_is_causal_skip` became a parameter of create_causal_mask only in newer transformers;
+    # here it exists as internal logic (the SDPA mask interface may return None to use is_causal).
+    # The QSA indexer needs a materialized mask, so honor the flag by building one explicitly.
+    from transformers import masking_utils as hf_masking
+    if 'allow_is_causal_skip' not in inspect.signature(hf_masking.create_causal_mask).parameters:
+        orig_create_causal_mask = hf_masking.create_causal_mask
+
+        def create_causal_mask(config, inputs_embeds, attention_mask, past_key_values, *args, **kwargs):
+            allow_is_causal_skip = kwargs.pop('allow_is_causal_skip', True)
+            causal_mask = orig_create_causal_mask(config, inputs_embeds, attention_mask, past_key_values, *args,
+                                                  **kwargs)
+            if causal_mask is None and not allow_is_causal_skip:
+                batch_size, q_length = inputs_embeds.shape[0], inputs_embeds.shape[1]
+                kv_length = q_length + (past_key_values.get_seq_length() if past_key_values is not None else 0)
+                # SDPA convention: 4D bool mask (batch, 1, q_length, kv_length), True = visible
+                causal_mask = torch.ones(q_length, kv_length, dtype=torch.bool,
+                                         device=inputs_embeds.device).tril()[None, None].expand(batch_size, -1, -1,
+                                                                                                -1)
+                if attention_mask is not None and attention_mask.dim() == 2:
+                    causal_mask = causal_mask & attention_mask.bool()[:, None, None, :kv_length]
+            return causal_mask
+
+        hf_masking.create_causal_mask = create_causal_mask
+
+    # Now the modeling file can be imported; register with the Auto classes for AutoConfig etc.
+    # The vision tower is built via AutoModel.from_config(config.vision_config), so the vision
+    # config/model pair must be registered as well.
+    # NOTE: `AutoModel.register` skips classes whose module starts with `transformers.` (it is
+    # meant for remote code), and adding entries to *_MAPPING_NAMES breaks module-name inference
+    # (there is no `transformers.models.qwen4_exp_vision` module), so write `_extra_content`
+    # directly -- class-keyed lookups in `_LazyAutoMapping` check it first.
+    from transformers import AutoConfig, AutoModel
+    import transformers.models.qwen4_exp.modeling_qwen4_exp as qwen4_exp_modeling
+    from transformers.models.qwen4_exp.configuration_qwen4_exp import (Qwen4ExpConfig, Qwen4ExpTextConfig,
+                                                                       Qwen4ExpVisionConfig)
+    from transformers.models.qwen4_exp.modeling_qwen4_exp import (Qwen4ExpModel, Qwen4ExpTextModel,
+                                                                   Qwen4ExpVisionModel)
+
+    # Upstream bug: the modular expansion of `Qwen4ExpTextGroupedRMSNorm(Qwen3_5RMSNorm)` dropped
+    # the base class (it now subclasses nn.Module), so `super()._norm()` fails at runtime. Inject
+    # the equivalent grouped RMS norm directly.
+    GroupedRMSNorm = qwen4_exp_modeling.Qwen4ExpTextGroupedRMSNorm
+    if not hasattr(GroupedRMSNorm.__bases__[0], '_norm'):
+
+        def _grouped_norm(self, hidden_states):
+            grouped_shape = (*hidden_states.shape[:-1], -1, self.group_size)
+            x = hidden_states.reshape(grouped_shape)
+            x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+            return x.flatten(-2)
+
+        GroupedRMSNorm._norm = _grouped_norm
+
+    # fla's triton kernel for chunk_gated_delta_rule crashes with "misaligned address" on some
+    # GPU/triton combinations (observed with fla 0.5.1 + triton 3.6.0). Setting
+    # QWEN4_EXP_TORCH_GDN=1 swaps in the modeling module's pure-torch reference implementation
+    # (slower, but robust); default keeps the fla kernel.
+    if os.environ.get('QWEN4_EXP_TORCH_GDN', '0') == '1':
+        fn = qwen4_exp_modeling.torch_chunk_gated_delta_rule
+        while hasattr(fn, '__wrapped__'):
+            fn = fn.__wrapped__
+        qwen4_exp_modeling.torch_chunk_gated_delta_rule = fn
+
+    try:
+        AutoConfig.register('qwen4_exp', Qwen4ExpConfig)
+    except ValueError:
+        pass  # already registered
+    # AutoModel keys are config classes; write directly since register() skips native modules.
+    for config_cls, model_cls in [(Qwen4ExpConfig, Qwen4ExpModel), (Qwen4ExpTextConfig, Qwen4ExpTextModel),
+                                  (Qwen4ExpVisionConfig, Qwen4ExpVisionModel)]:
+        if config_cls not in AutoModel._model_mapping._extra_content:
+            AutoModel._model_mapping._extra_content[config_cls] = model_cls
+
+    # Their dataclass defaults do not satisfy the strict validators (e.g. num_experts=None),
+    # so forbid the default-construction paths inside PretrainedConfig.to_diff_dict/to_dict.
+    Qwen4ExpTextConfig.has_no_defaults_at_init = True
+    Qwen4ExpConfig.has_no_defaults_at_init = True
+
+    # Naming drift between the checkpoint and the bundled module: the ckpt writes `full_attention`
+    # for its QSA layers, while this snapshot expects `deepseek_sparse_attention` (or
+    # `hybrid_indexed` when PLE sits on that layer). The modeling dispatch only checks
+    # `== "linear_attention"`, but the cache layer-class mapping needs the indexed names, so
+    # normalize in place before delegating to the original validator.
+    validators = getattr(Qwen4ExpTextConfig, '__class_validators__', None)
+    if validators is not None:
+        for idx, validator in enumerate(validators):
+            if getattr(validator, '__name__', '') == 'validate_architecture':
+                orig_validator = validator
+
+                def _validate_architecture(self, _orig=orig_validator):
+                    layer_types = self.layer_types
+                    if layer_types is not None and 'full_attention' in layer_types:
+                        ple_layer_ids = set(self.ple_layer_ids or [])
+                        self.layer_types = [
+                            ('hybrid_indexed' if layer_idx + 1 in ple_layer_ids else 'deepseek_sparse_attention')
+                            if layer_type == 'full_attention' else layer_type
+                            for layer_idx, layer_type in enumerate(layer_types)
+                        ]
+                    _orig(self)
+
+                validators[idx] = _validate_architecture
+
+    _QWEN4_EXP_COMPAT_DONE = True
+    return True
+
+
+class Qwen4ExpLoader(Qwen3VLLoader):
+
+    def get_model(self, model_dir: str, config, processor, model_kwargs) -> PreTrainedModel:
+        from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpForConditionalGeneration
+        self.auto_model_cls = self.auto_model_cls or Qwen4ExpForConditionalGeneration
+        return Qwen2VLLoader.get_model(self, model_dir, config, processor, model_kwargs)
+
+
+if _compat_qwen4_exp_transformers():
+    register_model(
+        ModelMeta(
+            MLLMModelType.qwen4_exp,
+            [
+                ModelGroup([
+                    Model('Qwen/Qwen-Air-Example-CKPT-BF16', 'Qwen/Qwen-Air-Example-CKPT-BF16'),
+                ], TemplateType.qwen4_exp),
+            ],
+            Qwen4ExpLoader,
+            model_arch=ModelArch.qwen2_vl,
+            architectures=['Qwen4ExpForConditionalGeneration'],
+            requires=['transformers>=5.14', 'qwen_vl_utils>=0.0.14', 'decord'],
+            tags=['vision', 'video']))
+
+
 def _read_num_eos_tokens(model_dir: str) -> int:
     import json
     sparse_info_path = os.path.join(model_dir, 'sparse_info.json')
@@ -1637,6 +1908,28 @@ register_model(
         architectures=['Qwen3_5ForConditionalGeneration'],
         additional_saved_files=['sparse_info.json', 'sparse_weights.pt'],
         requires=['transformers>=5.0.0.dev', 'qwen_vl_utils>=0.0.14', 'decord'],
+        tags=['vision', 'video']))
+
+
+class Qwen3_8FlashNextLoader(Qwen3VLLoader):
+    # Megatron-only model: HC/PLE/QSA/GDN hybrid, no HF transformers
+    # implementation; weights are handled by mcore-bridge
+    # (mcore_bridge/model/gpts/qwen3_8_flash_next.py).
+
+    def get_model(self, model_dir: str, config, processor, model_kwargs) -> PreTrainedModel:
+        raise NotImplementedError(
+            'Qwen3.8-Flash-Next has no HuggingFace transformers implementation; '
+            'only Megatron training via mcore-bridge is supported.')
+
+
+register_model(
+    ModelMeta(
+        MLLMModelType.qwen3_8_flash_next, [],
+        Qwen3_8FlashNextLoader,
+        template=TemplateType.qwen3_8,
+        model_arch=ModelArch.qwen3_vl,
+        architectures=['Qwen3_8FlashNextForConditionalGeneration'],
+        requires=['qwen_vl_utils>=0.0.14', 'decord'],
         tags=['vision', 'video']))
 
 

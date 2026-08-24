@@ -710,6 +710,27 @@ register_template(
         preserve_thinking=True,
         is_thinking=True))
 
+
+class Qwen4ExpTemplate(Qwen3_8Template):
+    # Qwen-Air (qwen4_exp): chat_template.jinja / tokenizer are byte-identical to Qwen3.8
+    # (only model_max_length differs), so the Qwen3.8 template behavior applies as-is.
+    # Verified: with the default enable_thinking=False (is_thinking + non_thinking_prefix),
+    # swift renders the empty-think prefix and byte-matches HF jinja in train/no-thinking/
+    # reasoning_effort=low; preserve_thinking=True matches jinja's undefined default.
+    pass
+
+
+register_template(
+    QwenTemplateMeta(
+        MLLMTemplateType.qwen4_exp,
+        template_cls=Qwen4ExpTemplate,
+        default_system=None,
+        thinking_prefix='<think>\n',
+        non_thinking_prefix='<think>\n\n</think>\n\n',
+        agent_template='qwen3_5',
+        preserve_thinking=True,
+        is_thinking=True))
+
 register_template(
     QwenTemplateMeta(
         MLLMTemplateType.ovis_ocr2,
