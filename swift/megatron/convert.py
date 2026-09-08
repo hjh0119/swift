@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 
+import gc
 import math
 import os
 import shutil
@@ -56,6 +57,17 @@ def convert_hf2mcore(args: ExportArguments) -> None:
     logger.info('Successfully transferred HF model weights to MG model.')
     _test_convert_precision = strtobool(os.getenv('SWIFT_TEST_CONVERT_PRECISION', '0'))
     if not _test_convert_precision:
+        if not args.test_convert_precision:
+            # `bridge.load_weights` streams from model_dir, so the HF model is no longer needed.
+            # Releasing it before saving keeps peak host RAM below ~2x the model size, which
+            # matters for very large checkpoints (e.g. GLM-5.3-Flash: ~614 GB per bf16 copy).
+            # `prepare_model_template` stores the model on the template whenever
+            # `template.use_model` is true (every multimodal template does), so that second
+            # reference has to be dropped too -- otherwise `del hf_model` frees nothing.
+            del hf_model
+            hf_model = None
+            template.model = None
+            gc.collect()
         args.save_args()
         logger.info('Saving the model...')
         save_mcore_checkpoint(megatron_args, [mg_model])

@@ -217,6 +217,7 @@ class MLLMTemplateType:
     glm_edge_v = 'glm_edge_v'
     glm4v = 'glm4v'
     glm4_5v = 'glm4_5v'
+    glm5_3 = 'glm5_3'
     glm_ocr = 'glm_ocr'
 
     minicpmv = 'minicpmv'

@@ -436,6 +436,54 @@ class GLM4_5VTemplate(GLM4vPackingTemplateMixin, GLM4_5Template):
 
 register_template(GLM4_5TemplateMeta(MLLMTemplateType.glm4_5v, template_cls=GLM4_5VTemplate))
 
+
+class GLM5_3Template(GLM4_5VTemplate):
+    """GLM-5.3-Flash: GLM-4.5V style vision tokens plus GLM-5.2 style reasoning effort.
+
+    GLM-5.3-Flash is a NoPE model (no rope_theta, no ``get_rope_index``), so the mRoPE
+    position-id computation inherited from GLM-4.5V does not apply; the default
+    sequential position ids are used instead.
+    """
+
+    def _get_position_ids(self, inputs: Dict[str, Any]):
+        return {}
+
+    def init_env_args(self):
+        super().init_env_args()
+        # reasoning_effort: "low", "high" or "max"
+        self.reasoning_effort = get_env_args('reasoning_effort', str, 'max')
+        self.chat_template_kwargs['reasoning_effort'] = self.reasoning_effort
+
+    def _get_system(self, inputs):
+        system = super()._get_system(inputs)
+        reasoning_effort = inputs.chat_template_kwargs.get('reasoning_effort')
+        if reasoning_effort is None:
+            reasoning_effort = self.reasoning_effort
+        if self._get_enable_thinking(inputs):
+            effort_str = f'Reasoning Effort: {reasoning_effort.capitalize()}'
+            if system:
+                system = f'{effort_str}<|system|>{system}'
+            else:
+                system = effort_str
+        return system
+
+    def init_processor(self, processor) -> None:
+        Template.init_processor(self, processor)
+        if not getattr(GLM5_3Template, '_patched', False) and self.padding_free:
+            GLM5_3Template._patched = True
+            from transformers.models.glm5_next import modeling_glm5_next
+            self._patch_create_causal_mask(modeling_glm5_next)
+
+
+register_template(
+    GLM4_7TemplateMeta(
+        MLLMTemplateType.glm5_3,
+        template_cls=GLM5_3Template,
+        agent_template='glm5_1',
+        non_thinking_prefix='<think></think>',
+        history_thinking_prefix='<think></think>',
+    ))
+
 glm4z1rumination_system = (
     '你是一个专业的深度研究助手，通过提供的工具与模拟浏览器交互，来帮助用户完成深度信息调研和报告撰写任务。'
     '今年是 2025 年。\n\n'

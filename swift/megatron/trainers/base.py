@@ -352,7 +352,7 @@ class BaseMegatronTrainer(ABC):
         # Map (wd_mult, lr_mult, is_expert_parallel, is_decoupled_lr) to params.
         params_map = {}
         for model_chunk in model_chunks:
-            visual = model_chunk.module.module.visual if is_multimodal else None
+            visual = getattr(model_chunk.module.module, 'visual', None) if is_multimodal else None
             for name, param in model_chunk.named_parameters():
                 if not param.requires_grad:
                     continue
@@ -498,7 +498,8 @@ class BaseMegatronTrainer(ABC):
         return iteration
 
     def _prepare_vit_gradient_checkpointing(self, model):
-        visual = model.visual
+        # `language_model_only=True` skips building the vision tower, so `visual` may be absent.
+        visual = getattr(model, 'visual', None)
         if visual is None:
             return
         for vision_tower in visual._vision_tower:
